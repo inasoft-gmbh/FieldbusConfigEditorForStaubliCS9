@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build output (distribute the .exe via GitHub Releases, not in git)
+build/
+dist/
+*.manifest
+
+# Runtime data the app creates next to itself
+settings.json
+templates/
+!assets/templates/
+!assets/templates/**
+.sandbox/
+
+# Local dev/throwaway scripts + generated previews (read private robot data)
+_*.py
+_*.png
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+profinet_populated.zip.bak
+
+# internal-only (lives in the private repo, never public)
+usr/
+memory/
+prototype/

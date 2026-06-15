@@ -1,0 +1,5 @@
+# Bundled SyCon templates (project XML, .nxd, safety configs) must keep their EXACT
+# bytes — SyCon/PROFIsafe reject altered files, so never apply EOL/text normalization.
+assets/templates/** -text
+docs/**/*.xml -text
+docs/**/*.nxd -text
