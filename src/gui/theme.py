@@ -4,6 +4,11 @@ A single source for colours so dialogs and the main window stay consistent.
 Look: deep slate background, cyan accent, monospace for technical data.
 """
 from __future__ import annotations
+from fbconfig.paths import asset as _asset
+
+# glyphs for QSS url() (forward slashes; Qt won't draw CSS border-triangles reliably)
+_CHECK = _asset("check.svg").replace("\\", "/")
+_CHEVRON = _asset("chevron.svg").replace("\\", "/")
 
 # --- palette ---------------------------------------------------------------
 BG          = "#0d1117"   # window background
@@ -118,7 +123,14 @@ QLineEdit, QSpinBox, QComboBox {{
     selection-background-color: {ACCENT}; selection-color: #04201d;
 }}
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
-QComboBox::drop-down {{ border: 0; width: 20px; }}
+/* make dropdowns clearly recognisable: a divider + a visible chevron */
+QComboBox {{ padding-right: 26px; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 22px; border-left: 1px solid {BORDER};
+    border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+}}
+QComboBox::down-arrow {{ image: url("{_CHEVRON}"); width: 12px; height: 12px; }}
 QComboBox QAbstractItemView {{
     background: {PANEL}; border: 1px solid {BORDER}; color: {TEXT};
     selection-background-color: {SELECTION}; selection-color: {TEXT};
@@ -132,7 +144,8 @@ QCheckBox::indicator {{ border-radius: 4px; }}
 QRadioButton::indicator:hover, QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
 QRadioButton::indicator:checked {{
     border: 5px solid {ACCENT}; background: #04201d; }}
-QCheckBox::indicator:checked {{ border-color: {ACCENT}; background: {ACCENT}; }}
+QCheckBox::indicator:checked {{
+    border-color: {ACCENT}; background: {ACCENT}; image: url("{_CHECK}"); }}
 /* selectable options read as a segmented control */
 QRadioButton {{ border: 1px solid {BORDER}; border-radius: 7px;
                padding: 5px 12px 5px 8px; background: {PANEL_HI}; }}

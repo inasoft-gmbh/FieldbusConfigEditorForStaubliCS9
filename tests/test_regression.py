@@ -365,6 +365,56 @@ check("device_lenprefix finds the prefix of a whitespace-empty device XML",
       blob_pn.device_lenprefix(_empty) == len(_hdr)
       and _empty[len(_hdr) + 4:] == _ws)
 
+print("== nxd_ec EtherCAT General Settings (locate + patch + MD5, fail-safe) ==")
+# Synthetic netX .nxd: 136-byte header (MD5 @0x54), a DECOY settings-record (implausible
+# values -> must be ignored) and the REAL settings-record block. Mirrors the byte-exact
+# layout reverse-engineered from SyCon (Watchdog @base, Vendor/Product/Revision/Serial,
+# Sync u16, Station Alias u16). Field offsets relative to base = sig_pos + 16.
+import struct
+from fbconfig import nxd_ec as _ec
+
+def _make_ec_nxd():
+    sig = bytes.fromhex("1700000074000000")
+    def block(startup, wd, ven, prod, rev, ser, sync, alias):
+        b = bytearray(48)
+        struct.pack_into("<IIIIII", b, 0, startup, wd, ven, prod, rev, ser)
+        b[24] = 0xcc
+        struct.pack_into("<H", b, 25, sync)
+        struct.pack_into("<H", b, 43, alias)
+        return bytes(b)
+    body = bytearray(b"\x00" * 40)
+    # base = sig_pos + 16 => 8 filler bytes between the 8-byte sig and the block
+    body += sig + b"\x00" * 8 + block(0, 0, 0x99999999, 0x88888888, 0, 0, 0, 0)  # decoy: wd=0, vendor huge
+    body += sig + b"\x00" * 8 + block(0, 1000, 0x584, 0x28, 0x20004, 0, 100, 0)  # real
+    d = bytearray(b"\x00" * 136 + bytes(body))
+    _ec.recompute_md5(d)
+    return bytes(d)
+
+_ecn = _make_ec_nxd()
+_g = _ec.read_general(_ecn)
+check("nxd_ec: locates real block past the decoy",
+      _g is not None and _g["watchdog_ms"] == 1000 and _g["vendor_id"] == 0x584)
+check("nxd_ec: reads all fields",
+      _g == {"bus_startup": 0, "watchdog_ms": 1000, "vendor_id": 0x584,
+             "product_code": 0x28, "revision": 0x20004, "serial": 0,
+             "sync_x10ns": 100, "station_alias": 0})
+_p = _ec.patch_general(_ecn, {"watchdog_ms": 2000, "bus_startup": 1,
+                              "sync_x10ns": 200, "station_alias": 7})
+_gp = _ec.read_general(_p)
+check("nxd_ec: patch updates the right fields",
+      _gp["watchdog_ms"] == 2000 and _gp["bus_startup"] == 1
+      and _gp["sync_x10ns"] == 200 and _gp["station_alias"] == 7
+      and _gp["vendor_id"] == 0x584)            # untouched
+check("nxd_ec: patch keeps length (in-place)", len(_p) == len(_ecn))
+check("nxd_ec: MD5 @0x54 recomputed over data[136:]",
+      _p[0x54:0x54 + 16] == __import__("hashlib").md5(_p[136:]).digest()
+      and _ec.md5_hex(_p) == __import__("hashlib").md5(_p[136:]).hexdigest().upper())
+check("nxd_ec: no-op patch is byte-identical",
+      _ec.patch_general(_ecn, {"watchdog_ms": 1000}) == _ecn)
+check("nxd_ec: fail-safe on unrecognised buffer (no sig)",
+      _ec.read_general(b"\x00" * 2000) is None
+      and _ec.patch_general(b"\x00" * 2000, {"watchdog_ms": 5}) == b"\x00" * 2000)
+
 print("== safety.generate_safe_variant (PROFINET non-safe -> safe by rename) ==")
 # A Staeubli PROFINET safe config is byte-identical to the non-safe one bar the
 # "_safe" name. generate_safe_variant must clone it preserving UUIDs/.nxd, retarget
@@ -445,6 +495,146 @@ try:
     check("generate: refuses when safe variant already exists", _again_ok)
 finally:
     _sh.rmtree(_tmp, ignore_errors=True)
+
+print("== blob_ec EtherCAT structural DELETE (byte-exact vs SyCon resize-down) ==")
+# Reference states are real-robot derived (confidential -> NOT in the public repo); the
+# check runs only when the local _fbce_ec_struct dir is present, else it is skipped.
+from pathlib import Path as _P
+_ecdir = _P.home() / "Desktop" / "_fbce_ec_struct"
+if (_ecdir / "state_2x2" / "J207J208.nxd").exists():
+    from fbconfig import blob_ec as _bec, sycon as _syc
+    import olefile as _ole, io as _io
+    _n2 = (_ecdir / "state_2x2" / "J207J208.nxd").read_bytes()
+    _n1 = (_ecdir / "state_1x1" / "J207J208.nxd").read_bytes()
+    def _lastsig(_nxd, _di):                 # (systemTag16, name) of the last In/Out 0x17 row
+        _rec = nxd_dbm.parse(_nxd).records[4]
+        _c, _last = -1, None
+        for _it in _rec:
+            if _it.type == 0x1f:
+                _c += 1
+            elif _it.type == 0x17 and _c == _di:
+                _ct = bytes(_it.content)
+                _p = len(_ct)
+                for _q in range(len(_ct) - 1, 3, -1):
+                    _r = _ct[_q:]
+                    if _r and all(32 <= b < 127 for b in _r) and \
+                       struct.unpack_from("<I", _ct, _q - 4)[0] == len(_r):
+                        _p = _q - 4
+                        break
+                _last = (_ct[16:32], _ct[_p + 4:].decode("utf-8", "replace"))
+        return _last
+    # derive the last input + output signal from the reference data (no hardcoded GUIDs)
+    _ib, _ibn = _lastsig(_n2, 0)
+    _qb, _qbn = _lastsig(_n2, 1)
+    _tags = {_ib, _qb}
+    check("blob_ec: nxd delete (row+0x1f-dir+@380/@408+MD5) byte-exact vs state_1x1",
+          _bec.delete_signals_nxd(_n2, _tags, 1, 1) == _n1)
+    _b2 = _syc.blob_from_xml((_ecdir / "state_2x2" / "SYCON_net.xml")
+                             .read_text(encoding="utf-8", errors="replace"))
+    _bref = _syc.blob_from_xml((_ecdir / "state_1x1" / "SYCON_net.xml")
+                               .read_text(encoding="utf-8", errors="replace"))
+    _bl = _bec.delete_last_signal(_bec.delete_last_signal(_b2, "input"), "output")
+    def _streams(_b):
+        _o = _ole.OleFileIO(_io.BytesIO(_b[4:]))
+        return {"/".join(_n): _o.openstream(_n).read() for _n in _o.listdir()}
+    _sm, _sr = _streams(_bl), _streams(_bref)
+    check("blob_ec: blob delete streams byte-exact vs state_1x1",
+          all(_sm.get(_k) == _sr.get(_k) for _k in set(_sm) | set(_sr)))
+    # ADD is the inverse of DELETE: re-adding the removed rows (same systemTag/name)
+    # must reproduce state_2x2 byte-exact (validates row insert + dir + offsets + serialize)
+    _d = _bec.delete_signals_nxd(_n2, _tags, 1, 1)
+    _a = _bec.add_signal_nxd(_bec.add_signal_nxd(_d, "input", _ib, _ibn, 1),
+                             "output", _qb, _qbn, 1)
+    check("blob_ec: nxd add round-trip add(delete(2x2)) byte-exact vs state_2x2",
+          _a == _n2)
+
+    # EDIT/REORDER preserve the systemTag (SyCon regenerates it) -> compare GUID-masked.
+    def _mask(_nxd):
+        _n = nxd_dbm.parse(_nxd)
+        _c = -1
+        for _it in _n.records[4]:
+            if _it.type == 0x1f:
+                _c += 1
+            elif _it.type == 0x17 and _c in (0, 1):
+                _it.content[16:32] = b"\x00" * 16
+        _o = bytearray(nxd_dbm.serialize(_n))
+        _o[0x54:0x54 + 16] = __import__("hashlib").md5(_o[136:]).digest()
+        return bytes(_o)
+    if (_ecdir / "d_edit" / "J207J208.nxd").exists():
+        _eb = (_ecdir / "d0_base" / "J207J208.nxd").read_bytes()
+        _er = (_ecdir / "d_edit" / "J207J208.nxd").read_bytes()
+        _et = bytes(next(it for it in nxd_dbm.parse(_eb).records[4]
+                         if it.type == 0x17).content[16:32])
+        check("blob_ec: nxd edit bit->word GUID-masked == d_edit",
+              _mask(_bec.edit_signal_nxd(_eb, _et, "word")) == _mask(_er))
+    if (_ecdir / "d_reorder" / "J207J208.nxd").exists():
+        _rb = (_ecdir / "d_reorder_base" / "J207J208.nxd").read_bytes()
+        _rr = (_ecdir / "d_reorder" / "J207J208.nxd").read_bytes()
+        _c, _tg = -1, []
+        for _it in nxd_dbm.parse(_rb).records[4]:
+            if _it.type == 0x1f:
+                _c += 1
+            elif _it.type == 0x17 and _c == 0:
+                _tg.append(bytes(_it.content[16:32]))
+        check("blob_ec: nxd reorder GUID-masked == d_reorder",
+              _mask(_bec.reorder_signals_nxd(_rb, "input", [_tg[1], _tg[0]])) == _mask(_rr))
+
+    # unified reconcile (set_direction_signals_nxd) — one pass for all ops
+    _C2DT = {0x80: ("bit", 8), 0x84: ("unsigned8", 1), 0x85: ("word", 1), 0x96: ("real32", 1)}
+    def _desired(_nxd, _dir):
+        _rec = nxd_dbm.parse(_nxd).records[4]
+        _c, _o, _di = -1, [], _bec._DIR_IDX[_dir]
+        for _it in _rec:
+            if _it.type == 0x1f:
+                _c += 1
+            elif _it.type == 0x17 and _c == _di:
+                _ct = bytes(_it.content)
+                _p = len(_ct)
+                for _q in range(len(_ct) - 1, 3, -1):
+                    _run = _ct[_q:]
+                    if _run and all(32 <= b < 127 for b in _run) and \
+                       struct.unpack_from("<I", _ct, _q - 4)[0] == len(_run):
+                        _p = _q - 4
+                        break
+                _dt, _ae = _C2DT.get(_ct[48], ("unsigned8", 1))
+                _o.append((_ct[16:32], _ct[_p + 4:].decode("utf-8", "replace"), _dt, _ae))
+        return _o
+    _din, _dout = _desired(_n2, "input"), _desired(_n2, "output")
+    _r = _bec.set_direction_signals_nxd(_n2, "input", _din)
+    _r = _bec.set_direction_signals_nxd(_r, "output", _dout)
+    check("blob_ec: nxd reconcile idempotent byte-exact vs state_2x2", _r == _n2)
+    _r = _bec.set_direction_signals_nxd(_n2, "input", _din[:-1])
+    _r = _bec.set_direction_signals_nxd(_r, "output", _dout[:-1])
+    check("blob_ec: nxd reconcile delete-last byte-exact vs state_1x1", _r == _n1)
+else:
+    print("  (skipped: _fbce_ec_struct reference states not present)")
+
+print("== blob_eip EtherNet/IP (NETX 51 RE/EIS) structural reconcile ==")
+# Reference projects are real-robot derived (NOT in the public repo); run only when present.
+_eipdir = _P.home() / "Desktop" / "_fbce_eip_struct"
+if (_eipdir / "mixed_types").exists():
+    from fbconfig import blob_eip as _bep, project as _proj
+    import io as _io2, olefile as _ole2
+    def _eipblob(_ex):
+        _pp = [p for p in _proj.discover(_eipdir / _ex)
+               if "ethernet" in (p.protocol or "").lower()][0]
+        return _syc.blob_from_xml(_pp.sycon_xml.read_text(encoding="utf-8", errors="replace"))
+    def _eis(_b):
+        _o = _ole2.OleFileIO(_io2.BytesIO(_b[4:]))
+        return _o.openstream("CahedAdapter/EISAdapterBasic").read()
+    for _ex in ("size_64x48", "mixed_types"):
+        _b = _eipblob(_ex)
+        _s = _bep.read_signals(_b)
+        _din = [(x[5], x[1], x[2], x[3]) for x in _s if x[0] == "input"]
+        _dout = [(x[5], x[1], x[2], x[3]) for x in _s if x[0] == "output"]
+        _b2 = _bep.set_direction_signals(_b, "input", _din)
+        _b2 = _bep.set_direction_signals(_b2, "output", _dout)
+        check(f"blob_eip: {_ex} signal round-trip EISAdapterBasic byte-exact",
+              _eis(_b2) == _eis(_b))
+        check(f"blob_eip: {_ex} rebuilt blob is a valid CFB",
+              _ole2.isOleFile(_io2.BytesIO(_b2[4:])))
+else:
+    print("  (skipped: _fbce_eip_struct reference projects not present)")
 
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed.",

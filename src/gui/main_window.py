@@ -18,7 +18,7 @@ from gui.winutil import dark_titlebar
 from gui.toast import ToastManager
 from gui.command_palette import CommandPalette
 from gui.inspector import (InspectorPanel, AddForm, ResizeForm, GeneralForm,
-                          StationForm, EipAddForm, ModuleForm,
+                          StationForm, EipAddForm, ec_signal_form, ModuleForm,
                           PnSignalForm, ModuleEditForm, en_label)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
@@ -1128,7 +1128,12 @@ class MainWindow(QMainWindow):
 
     # ---- actions ----
     def on_open(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select the robot main folder")
+        # Start in the current project's folder if one is open this session, else the folder
+        # remembered from the last session (settings 'last_folder') — not the .exe directory.
+        start = self.state.robot_dir or self.cfg.get("last_folder", "") or ""
+        if start and not Path(start).is_dir():
+            start = ""
+        folder = QFileDialog.getExistingDirectory(self, "Select the robot main folder", start)
         if folder:
             self._load_folder(folder)
 
@@ -1208,18 +1213,22 @@ class MainWindow(QMainWindow):
             self._status("In and Out are both full — delete a signal or resize "
                          "first.", "error")
             return
-        if m.raw.get("bit_addressed"):
-            return self._on_add_eip()
-        # preselect the direction + START BYTE the user is pointing at (the selected
-        # row, signal or free); switch to the direction that has room if full.
+        # All flat protocols (EtherCAT / EtherNet/IP / POWERLINK) use the SAME page as
+        # PROFINET (PnSignalForm) — start byte / type / separate-array / count / name /
+        # numbering + live preview — so add+edit are identical everywhere.
         direction = self._active_direction() or "In"
+        if direction == "In" and in_free <= 0:
+            direction = "Out"
+        elif direction == "Out" and out_free <= 0:
+            direction = "In"
+        iface = m.inp if direction == "In" else m.out
         tbl = self.in_tbl if direction == "In" else self.out_tbl
         start = tbl.table.selected_start_byte()
-        if (direction == "In" and in_free <= 0) or (direction == "Out" and out_free <= 0):
-            direction, start = ("Out" if direction == "In" else "In"), None
-        form = AddForm(m, self.cfg, direction, start_byte=start)
+        if start is None:
+            start = iface.used_bytes                  # default: the first free byte
+        form = ec_signal_form(m, self.cfg, direction, start_byte=start)
         form.preview.connect(self._preview_add)
-        self.inspector.open(form, "Add data type(s)", "Add")
+        self.inspector.open(form, "Add signal", "Add")
 
     def _pn_fail(self, title, exc):
         """Log a full diagnostic (traceback + blob state) for a failed PROFINET op and
@@ -1300,18 +1309,20 @@ class MainWindow(QMainWindow):
             msg = f"Delete '{iface.signals[idxs[0]].name}' from {iface.direction}?"
         else:
             msg = f"Delete {len(idxs)} signals from {iface.direction}?"
-        detail = ("The freed bytes stay as a gap in place — the other signals keep "
-                  "their addresses.") if self.state.model.raw.get("bit_addressed") \
-            else "Following bytes shift up to close the gap."
+        detail = ("Following signals shift up to close the gap; the interface SIZE stays "
+                  "the same (the freed bytes become free space at the end).")
 
         def _do():
+            m = self.state.model
             for i in sorted(idxs, reverse=True):   # high -> low keeps indices valid
                 iface.remove(i)
-            if self.state.model.raw.get("bit_addressed"):
-                # Leave a GAP exactly where the signal was — do NOT shift the rest.
-                # The process image is a fixed size, so the freed bytes just become
-                # free space (addresses of all other signals stay stable).
-                self.state.model.raw["layout_dirty"] = True
+            # All flat protocols behave alike: close the gap, KEEP the interface size
+            # (freed bytes -> trailing free). Bit-addressed repacks to bit offsets;
+            # POWERLINK is byte-addressed (order already defines a contiguous layout).
+            if m.raw.get("bit_addressed"):
+                m.inp.repack_bits()
+                m.out.repack_bits()
+            m.raw["layout_dirty"] = True
             return f"Deleted {len(idxs)} signal(s) in {iface.direction}."
 
         self._overlay_confirm("Delete signals", msg, _do, detail,
@@ -1330,7 +1341,16 @@ class MainWindow(QMainWindow):
         if idxs and len(idxs) > 1:
             return self._rename_batch(iface, idxs)
         if idxs:
-            return tbl.table.edit_signal_name(idxs[0])     # in-cell rename
+            # Structural-capable flat protocols (EtherCAT / POWERLINK) use the SAME full edit
+            # page as PROFINET (start byte / type / separate-array / count / name / numbering
+            # + live preview), UUID preserved. Rename-only protocols (EtherNet/IP) keep the
+            # quick in-cell rename until their structural write exists.
+            if bool(raw.get("structural", not raw.get("modular"))):
+                form = ec_signal_form(self.state.model, self.cfg, iface.direction,
+                                      edit_sig=iface.signals[idxs[0]])
+                form.preview.connect(self._preview_add)
+                return self.inspector.open(form, "Edit signal", "Apply")
+            return tbl.table.edit_signal_name(idxs[0])     # in-cell rename (rename-only)
         # nothing (or a free byte) selected -> add, if this protocol supports it
         if bool(raw.get("structural", not raw.get("modular"))):
             return self.on_add()
@@ -1795,13 +1815,13 @@ class MainWindow(QMainWindow):
         # a size change means swapping catalog modules — still skeleton-based.
         if raw.get("protocol_kind") == "profinet":
             return self._on_resize_profinet()
-        # EtherNet/IP: the image size is NOT at a device-independent .nxd offset
-        # (plus CIP assembly sizes live in the blob), so the target size is taken
-        # from a SyCon-saved skeleton. (configMD5 itself = md5(nxd[136:]) is derivable.)
-        if raw.get("protocol_kind") == "ethernetip":
+        # EtherNet/IP OLD variant: size from a SyCon-saved skeleton (assembly sizes live
+        # in the blob). The NETX 51 RE/EIS variant (eip_eis) carries the size in the .nxd
+        # (@1141/@1181) -> simple spinbox like EtherCAT/POWERLINK.
+        if raw.get("protocol_kind") == "ethernetip" and not raw.get("eip_eis"):
             return self._on_resize_eip()
-        # POWERLINK (@324/@326) and EtherCAT (@380/@408) carry the image size in the
-        # .nxd, patched on save -> simple byte-count spinbox, no skeleton needed.
+        # POWERLINK (@324/@326), EtherCAT (@380/@408), EIP-EIS (.nxd @1141/@1181) carry the
+        # image size in the .nxd, patched on save -> simple byte-count spinbox.
         form = ResizeForm(self.state.model, self._active_direction())
         self.inspector.open(form, "Change interface size", "Apply")
 

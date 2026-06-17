@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QComboBox,
     QSpinBox, QLineEdit, QRadioButton, QButtonGroup, QPushButton, QScrollArea,
-    QListWidget,
+    QListWidget, QCheckBox,
 )
 
 
@@ -139,6 +139,8 @@ class AddForm(InspectorForm):
         self.count.setMaximum(99999)
         sf.addRow("Count", self.count)
         self.prefix = QLineEdit()
+        self._prefix_touched = False
+        self.prefix.textEdited.connect(lambda *_: setattr(self, "_prefix_touched", True))
         sf.addRow("Name prefix", self.prefix)
         self.start = QSpinBox()
         self.start.setRange(0, 99999)
@@ -161,6 +163,8 @@ class AddForm(InspectorForm):
         self.arr_len_lbl = QLabel("Array length")
         af.addRow(self.arr_len_lbl, self.arr_len)
         self.arr_name = QLineEdit()
+        self._arr_name_touched = False
+        self.arr_name.textEdited.connect(lambda *_: setattr(self, "_arr_name_touched", True))
         af.addRow("Signal name", self.arr_name)
         root.addWidget(self.arr_box)
 
@@ -217,17 +221,17 @@ class AddForm(InspectorForm):
         self.startb.setEnabled(not single_bit)
         self.sep_box.setVisible(separate or single_bit)
         self.arr_box.setVisible(not separate and not single_bit)
+        # keep the auto-suggested name in sync with the data type — until the user edits it
         if separate or single_bit:
-            self.prefix.setText(self.prefix.text()
-                                or f"{iface.direction}_{'bit' if single_bit else dname}_")
-            if not self.prefix.text().strip():
-                self.prefix.setText(f"{iface.direction}_{dname}_")
+            if not self._prefix_touched:
+                base = 'bit' if single_bit else dname
+                self.prefix.setText(f"{iface.direction}_{base}_")
         else:
             if dt.key == "bit":
                 self.arr_len_lbl.setText("Array length in BYTES (×8 bits)")
             else:
                 self.arr_len_lbl.setText(f"Array length (number of {dname})")
-            if not self.arr_name.text().strip():
+            if not self._arr_name_touched:
                 self.arr_name.setText(f"{iface.direction}_{dname}_array")
 
         nbytes = self._nbytes()
@@ -359,7 +363,9 @@ class ResizeForm(InspectorForm):
 
         def _spin(iface):
             sb = QSpinBox()
-            sb.setMaximum(1490)
+            sb.setMaximum(1486)
+            # The size is a budget; signals stay put. Can't go below the bytes in use
+            # (delete signals first to shrink further).
             sb.setMinimum(iface.used_bytes)
             sb.setValue(iface.max_bytes)
             sb.valueChanged.connect(self._sync)
@@ -395,8 +401,13 @@ class ResizeForm(InspectorForm):
             f"free {self.out_size.value() - o.used_bytes:>4}")
 
     def apply(self):
+        # Size is the configured interface budget; signals are untouched. Growing it adds
+        # FREE bytes the user can fill via Add; shrinking frees trailing budget. (EtherCAT
+        # writes this size as the SM length; re-validate in SyCon.net.)
         self.model.inp.max_bytes = self.in_size.value()
         self.model.out.max_bytes = self.out_size.value()
+        if self.model.raw.get("protocol_kind") == "ethercat" or self.model.raw.get("eip_eis"):
+            self.model.raw["layout_dirty"] = True
         return (f"In max {self.model.inp.max_bytes} "
                 f"({self.model.inp.free_bytes} free), "
                 f"Out max {self.model.out.max_bytes} "
@@ -486,7 +497,14 @@ class StationForm(InspectorForm):
         form = QFormLayout()
         form.setSpacing(10)
         kind = self.fields.get("kind")
-        if kind == "ip":
+        # EtherCAT carries a Val3 stationAddress (the <0> in the device name) that SyCon
+        # keeps fixed at 0 and never exposes — EtherCAT addresses by bus position / the
+        # Station Alias (shown below). So we don't offer it as an editable field; the
+        # settable address for EtherCAT is the Station alias in the General block.
+        self.edit = None
+        if model.raw.get("protocol_kind") == "ethercat":
+            pass
+        elif kind == "ip":
             self.edit = QLineEdit(self.fields.get("ip", ""))
             self.edit.setPlaceholderText("a.b.c.d")
             form.addRow("IP address", self.edit)
@@ -525,6 +543,45 @@ class StationForm(InspectorForm):
             form.addRow("Watchdog time (ms)", self.wd)
             form.addRow("Bus startup", self.startup)
             form.addRow("Byte order", self.endian)
+            ios = model.raw.get("pn_io_state")
+            if ios is not None:                  # IO State Information (Producer) — read-only
+                lbl = QLabel({0: "Disabled", 1: "Bit", 2: "Byte"}.get(ios, str(ios)))
+                lbl.setObjectName("Dim")
+                form.addRow("IO state (read-only)", lbl)
+
+        # EtherCAT: SyCon "General Settings" scalars (Stufe 1), all written byte-exact
+        # to the export .nxd + configMD5. Ident is shown read-only (device identity).
+        self._ec = (model.raw.get("protocol_kind") == "ethercat")
+        self.ec = {}
+        g = model.raw.get("ec_general") if self._ec else None
+        if g:
+            self.ec["wd"] = QSpinBox(); self.ec["wd"].setRange(0, 0xFFFFFF)
+            self.ec["wd"].setValue(int(g.get("watchdog_ms", 0)))
+            self.ec["startup"] = QComboBox()
+            self.ec["startup"].addItems(["Automatically by device",
+                                         "Controlled by application"])
+            self.ec["startup"].setCurrentIndex(1 if g.get("bus_startup") else 0)
+            self.ec["sync"] = QSpinBox(); self.ec["sync"].setRange(0, 0xFFFF)
+            self.ec["sync"].setValue(int(g.get("sync_x10ns", 0)))
+            self.ec["alias"] = QSpinBox(); self.ec["alias"].setRange(0, 0xFFFF)
+            self.ec["alias"].setValue(int(g.get("station_alias", 0)))
+            form.addRow("Watchdog time (ms)", self.ec["wd"])
+            form.addRow("Bus startup", self.ec["startup"])
+            form.addRow("SyncImpulseLength (×10 ns)", self.ec["sync"])
+            form.addRow("Station alias", self.ec["alias"])
+            if "io_data_status" in g:        # blob-only (no .nxd / robot effect)
+                self.ec["ios"] = QComboBox()
+                self.ec["ios"].addItems(["None", "1 Byte", "2 Bytes",
+                                         "3 Bytes", "4 Bytes"])
+                iv = int(g.get("io_data_status") or 0)
+                self.ec["ios"].setCurrentIndex(iv if 0 <= iv < self.ec["ios"].count() else 0)
+                form.addRow("I/O data status", self.ec["ios"])
+            ident = QLabel(f"Vendor 0x{g.get('vendor_id', 0):X} · "
+                           f"Product 0x{g.get('product_code', 0):X} · "
+                           f"Rev 0x{g.get('revision', 0):X} · "
+                           f"Serial 0x{g.get('serial', 0):X}")
+            ident.setObjectName("Dim")
+            form.addRow("Ident (read-only)", ident)
         root.addLayout(form)
         if self._pn:
             note = QLabel("Device name -> _nwid.nxd + Val3 + SyCon project (names up to "
@@ -542,26 +599,29 @@ class StationForm(InspectorForm):
 
     def apply(self):
         from fbconfig.protocols import ethernetip as eip
-        val = self.edit.text().strip()
+        val = self.edit.text().strip() if self.edit is not None else ""
         kind = self.fields.get("kind")
-        if kind == "ip" and not valid_ip(val):
-            raise ValueError("Invalid IP address (expected a.b.c.d, 0–255).")
-        if not val:
-            raise ValueError("Value must not be empty.")
-        self.fields[{"ip": "ip", "name": "name", "station": "station"}.get(kind, "raw")] = val
-        new_station = eip.build_station(self.fields)
-        self.model.raw["station_new"] = new_station
-        self.model.raw["station_fields"] = self.fields
-        d = self.model.device
-        if kind == "ip":
-            d.ip = val
-        elif kind == "name":
-            d.node_name = val
-        elif kind == "station":
-            try:
-                d.node_id = int(val)
-            except ValueError:
+        new_station = None
+        if val:
+            if kind == "ip" and not valid_ip(val):
+                raise ValueError("Invalid IP address (expected a.b.c.d, 0–255).")
+            self.fields[{"ip": "ip", "name": "name",
+                         "station": "station"}.get(kind, "raw")] = val
+            new_station = eip.build_station(self.fields)
+            self.model.raw["station_new"] = new_station
+            self.model.raw["station_fields"] = self.fields
+            d = self.model.device
+            if kind == "ip":
+                d.ip = val
+            elif kind == "name":
                 d.node_name = val
+            elif kind == "station":
+                try:
+                    d.node_id = int(val)
+                except ValueError:
+                    d.node_name = val
+        elif not self._ec:                       # EtherCAT may edit only the scalars
+            raise ValueError("Value must not be empty.")
         extra = ""
         if self._pn and self.wd is not None:
             self.model.raw["pn_watchdog"] = self.wd.value()
@@ -570,7 +630,19 @@ class StationForm(InspectorForm):
             extra = (f", watchdog {self.wd.value()} ms, "
                      f"{'big' if self.endian.currentIndex() == 0 else 'little'} endian, "
                      f"startup {'app' if self.startup.currentIndex() else 'auto'}")
-        return f"Network identity set to '{new_station}'{extra}."
+        if self._ec and self.ec:
+            g = dict(self.model.raw.get("ec_general") or {})
+            g["watchdog_ms"] = self.ec["wd"].value()
+            g["bus_startup"] = self.ec["startup"].currentIndex()   # 0=auto,1=app
+            g["sync_x10ns"] = self.ec["sync"].value()
+            g["station_alias"] = self.ec["alias"].value()
+            if "ios" in self.ec:
+                g["io_data_status"] = self.ec["ios"].currentIndex()
+            self.model.raw["ec_general"] = g
+            extra = (f", watchdog {g['watchdog_ms']} ms, startup "
+                     f"{'app' if g['bus_startup'] else 'auto'}, "
+                     f"sync {g['sync_x10ns']}, alias {g['station_alias']}")
+        return f"Network identity '{new_station or '(unchanged)'}'{extra}."
 
 
 class ModuleForm(InspectorForm):
@@ -835,6 +907,17 @@ class PnSignalForm(InspectorForm):
         self.module = module                       # parse_modules dict for this slot
         self.dirn = direction                      # "In" / "Out"
         self.edit = edit                           # signal dict being edited, or None
+        # The flat protocols (EtherCAT / EtherNet/IP / POWERLINK) reuse this EXACT page —
+        # the whole direction is one synthetic slot; only the header text + apply() target
+        # differ (model rebuild vs the PROFINET blob writer). PROFINET keeps the slot model.
+        pk = model.raw.get("protocol_kind")
+        self.is_pn = pk == "profinet"
+        self.is_flat = not self.is_pn          # model-rebuild protocols
+        self.is_pl = pk == "powerlink"         # byte-addressed (no bit_offset / repack)
+        self.is_ec = self.is_flat              # back-compat alias (slot wording etc.)
+        self._pname = {"ethercat": "EtherCAT", "ethernetip": "EtherNet/IP",
+                       "powerlink": "POWERLINK"}.get(pk, "")
+        self.iface = (model.inp if direction == "In" else model.out) if self.is_flat else None
         self._cur = [dict(s) for s in module["signals"]]
         if edit is not None:                       # editing: drop the original; re-add
             self._cur = [s for s in self._cur if s is not edit and not (
@@ -847,10 +930,11 @@ class PnSignalForm(InspectorForm):
             self.dtype.setCurrentText(edit["dtype"])
             arr = edit.get("arr", 1)
             if arr > 1:
-                self.mode_arr.setChecked(True)
+                self.arr_cb.setChecked(True)
                 self.count.setValue(arr // 8 if edit["dtype"] == "bit" else arr)
             self.startb.setValue(min(edit["byte"], module["size"] - 1))
             self.prefix.setText(edit["name"])
+            self._prefix_touched = True            # keep the edited signal's name as-is
         else:
             self.startb.setValue(min(start_byte, module["size"] - 1))
         self._recompute()
@@ -860,8 +944,9 @@ class PnSignalForm(InspectorForm):
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(12)
         m = self.module
-        head = QLabel(f"Slot {m['slot']} · {en_label(m['module_type'])} · {m['size']} B "
-                      f"({'Inputs' if m['direction'] == 'input' else 'Outputs'})")
+        _io = 'Inputs' if m['direction'] == 'input' else 'Outputs'
+        head = QLabel(f"{self._pname} · {m['size']} B ({_io})" if self.is_flat else
+                      f"Slot {m['slot']} · {en_label(m['module_type'])} · {m['size']} B ({_io})")
         head.setObjectName("Dim")
         head.setWordWrap(True)
         root.addWidget(head)
@@ -869,31 +954,29 @@ class PnSignalForm(InspectorForm):
         form = QFormLayout()
         form.setSpacing(10)
         self.startb = QSpinBox()
-        self.startb.setToolTip("First byte WITHIN the slot the signal occupies.")
-        form.addRow("Start byte (in slot)", self.startb)
+        self.startb.setToolTip("First byte the signal occupies." if self.is_ec else
+                               "First byte WITHIN the slot the signal occupies.")
+        # EtherCAT has no slots -> just "Start byte"; PROFINET keeps "(in slot)" (the byte is
+        # relative to the slot, not the global image).
+        form.addRow("Start byte" if self.is_ec else "Start byte (in slot)", self.startb)
         self.dtype = QComboBox()
         self.dtype.addItems([n for n, _ in _SIG_DTYPES])
         self.dtype.setCurrentText(self.cfg.get("last_type", "byte")
                                   if self.cfg.get("last_type") in _SIG_BITS else "byte")
         form.addRow("Data type", self.dtype)
 
-        mode_row = QHBoxLayout()
-        self.mode_sep = QRadioButton("Separate")
-        self.mode_arr = QRadioButton("Array")
-        grp = QButtonGroup(self)
-        grp.addButton(self.mode_sep, 0)
-        grp.addButton(self.mode_arr, 1)
-        self.mode_sep.setChecked(True)
-        mode_row.addWidget(self.mode_sep)
-        mode_row.addWidget(self.mode_arr)
-        mode_row.addStretch()
-        form.addRow("How to add", mode_row)
+        # binary choice -> a single checkbox (cleaner + clearer than a 2-item dropdown):
+        # unchecked = separate values, checked = one array signal.
+        self.arr_cb = QCheckBox("Combine into one array signal")
+        form.addRow("How to add", self.arr_cb)
 
         self.count = QSpinBox()
         self.count.setRange(1, 9999)
         self.count_lbl = QLabel("Count")
         form.addRow(self.count_lbl, self.count)
         self.prefix = QLineEdit()
+        self._prefix_touched = getattr(self, "_prefix_touched", False)
+        self.prefix.textEdited.connect(self._mark_prefix_touched)   # only USER edits
         form.addRow("Name / prefix", self.prefix)
         self.nstart = QSpinBox()
         self.nstart.setRange(0, 99999)
@@ -917,9 +1000,15 @@ class PnSignalForm(InspectorForm):
         root.addStretch()
 
         self.dtype.currentIndexChanged.connect(self._recompute)
-        self.mode_sep.toggled.connect(self._recompute)
+        self.arr_cb.toggled.connect(self._recompute)
         for sb in (self.startb, self.count):
             sb.valueChanged.connect(self._recompute)
+
+    def _mark_prefix_touched(self, *_):
+        self._prefix_touched = True
+
+    def _is_sep(self):
+        return not self.arr_cb.isChecked()         # unchecked = separate values
 
     def _dt(self):
         return self.dtype.currentText()
@@ -932,7 +1021,7 @@ class PnSignalForm(InspectorForm):
         n = self.count.value()
         if self._is_bit():
             # separate: n single bits packed into whole bytes; array: n bytes (×8 bits)
-            return (n + 7) // 8 if self.mode_sep.isChecked() else n
+            return (n + 7) // 8 if self._is_sep() else n
         each = _SIG_BITS[self._dt()] // 8
         return n * each
 
@@ -947,12 +1036,14 @@ class PnSignalForm(InspectorForm):
     def _recompute(self, *_):
         m = self.module
         dt = self._dt()
-        sep = self.mode_sep.isChecked()
+        sep = self._is_sep()
         if self._is_bit():
             self.count_lbl.setText("Count (bits, ×8)" if sep else "Array length (bytes)")
         else:
             self.count_lbl.setText("Count" if sep else "Array length")
-        if not self.prefix.text().strip():
+        # auto-suggest a name prefix from direction + data type, and KEEP it in sync with the
+        # type — until the user edits it themselves (then leave their text alone).
+        if not self._prefix_touched:
             self.prefix.setText(f"{'In' if m['direction'] == 'input' else 'Out'}_{dt}_")
 
         start = self.startb.value()
@@ -965,20 +1056,26 @@ class PnSignalForm(InspectorForm):
         self._ok = nbytes > 0 and in_slot and not overlap and bit_ok
 
         free = m["size"] - len(self._occupied()) // 8
-        self.info.setText(
-            f"Slot {m['slot']}: {m['size']} B, ~{free} B free. "
-            f"New data: bytes {start}–{start + nbytes - 1} of the slot "
-            f"({nbytes} B) → global {m['global_start'] + start}–"
-            f"{m['global_start'] + start + nbytes - 1}.")
+        where = "interface" if self.is_ec else "slot"
+        if self.is_ec:
+            self.info.setText(
+                f"{m['size']} B {where}, ~{free} B free. New data: bytes "
+                f"{start}–{start + nbytes - 1} ({nbytes} B).")
+        else:
+            self.info.setText(
+                f"Slot {m['slot']}: {m['size']} B, ~{free} B free. "
+                f"New data: bytes {start}–{start + nbytes - 1} of the slot "
+                f"({nbytes} B) → global {m['global_start'] + start}–"
+                f"{m['global_start'] + start + nbytes - 1}.")
 
         msg = ""
         if not bit_ok:
             msg = "✕ Separate bits must come in whole bytes — use a count of 8, 16, …"
         elif not in_slot:
-            msg = (f"✕ Runs past the slot end (byte {start + nbytes} > {m['size']}). "
+            msg = (f"✕ Runs past the {where} end (byte {start + nbytes} > {m['size']}). "
                    "Lower the count or pick an earlier start byte.")
         elif overlap:
-            msg = f"✕ Overlaps an existing signal in this slot. Pick a free byte."
+            msg = f"✕ Overlaps an existing signal in this {where}. Pick a free byte."
         self.warn.setText(msg)
         self.warn.setVisible(bool(msg))
 
@@ -1010,11 +1107,11 @@ class PnSignalForm(InspectorForm):
             return (prefix.rstrip("_") or scheme.name(i)) if total == 1 else scheme.name(i)
 
         new = []
-        if self._is_bit() and self.mode_sep.isChecked():
+        if self._is_bit() and self._is_sep():
             for i in range(n):                       # n single bits, byte.bit
                 new.append(dict(name=sep_name(i, n), dtype="bit",
                                 byte=start + i // 8, bit=i % 8, arr=1))
-        elif self.mode_sep.isChecked():
+        elif self._is_sep():
             each = _SIG_BITS[dt] // 8
             for i in range(n):                       # n separate values
                 new.append(dict(name=sep_name(i, n), dtype=dt,
@@ -1033,9 +1130,38 @@ class PnSignalForm(InspectorForm):
             s["uid"] = str(uuid.uuid4())
         if self.edit is not None and new and self.edit.get("uid"):
             new[0]["uid"] = self.edit["uid"]
+        self._cur.extend(new)
+        if self.is_flat:
+            # Flat protocols (EtherCAT / EtherNet/IP / POWERLINK): rebuild the MODEL (the
+            # protocol writer compiles it on save) instead of writing the PROFINET blob.
+            # Signals ordered by byte, the interface SIZE (max_bytes) kept (trailing free
+            # allowed). UID travels. Bit-addressed protocols repack to bit offsets; POWERLINK
+            # is byte-addressed (offsets derive from order, bit_offset stays None).
+            from fbconfig.model import Signal as Sig
+            st = "input" if self.dirn == "In" else "output"
+            ordered = sorted(self._cur, key=lambda s: (s["byte"], s.get("bit", 0)))
+            snap = list(self.iface.signals)
+            self.iface.signals[:] = [
+                Sig(name=s["name"], sycon_dtype=s["dtype"], array_elements=s.get("arr", 1) or 1,
+                    systemtag=s["uid"], signal_type=st) for s in ordered]
+            if self.is_pl:                       # byte-addressed: order defines the layout
+                if self.iface.used_bytes > self.iface.max_bytes:
+                    self.iface.signals[:] = snap
+                    raise ValueError("Does not fit — grow the interface (Resize) first.")
+            else:
+                try:
+                    self.iface.repack_bits()
+                except ValueError as e:
+                    self.iface.signals[:] = snap
+                    raise ValueError(f"{e} Grow the interface (Resize) first.")
+            self.model.raw["layout_dirty"] = True
+            uids = {s["uid"] for s in new}
+            self.added = [s for s in self.iface.signals if s.systemtag in uids]
+            self.direction = self.iface.direction
+            verb = "Edited" if self.edit is not None else f"Added {len(new)}"
+            return f"{verb} signal(s) in {self.iface.direction}. Re-validate in SyCon.net."
         self.pn_added_uids = [s["uid"] for s in new]
         self.pn_direction = self.dirn
-        self._cur.extend(new)
         xml = self.paths.sycon_xml.read_text("utf-8", "replace")
         new_xml = blob_pn.write_module_signals(xml, m["slot"], self._cur,
                                                m["direction"], m["global_start"])
@@ -1045,6 +1171,33 @@ class PnSignalForm(InspectorForm):
         verb = "Updated" if self.edit is not None else f"Added {len(new)}"
         return (f"{verb} signal(s) in Slot {m['slot']}. "
                 f"{len(self._cur)} signals in the slot now.")
+
+
+def ec_signal_form(model, cfg, direction, start_byte=0, edit_sig=None):
+    """Open the PROFINET signal page (the SAME PnSignalForm) for a FLAT protocol — EtherCAT /
+    EtherNet/IP / POWERLINK — so the GUI + data-type selection are identical everywhere. The
+    whole direction is one synthetic slot (size = interface budget); PnSignalForm rebuilds the
+    model on apply. Byte positions come from each signal's bit offset (bit-addressed) or its
+    byte offset (POWERLINK). `edit_sig` = the model Signal being edited (UID preserved)."""
+    iface = model.inp if direction == "In" else model.out
+    byte_mode = model.raw.get("protocol_kind") == "powerlink"   # no bit_offset
+    sigs = []
+    for i, s in enumerate(iface.signals):
+        if byte_mode:
+            byte, bit = iface.byte_offset(i), 0
+        else:
+            bo = s.bit_offset or 0
+            byte, bit = bo // 8, bo % 8
+        sigs.append(dict(name=s.name, dtype=s.sycon_dtype, byte=byte, bit=bit,
+                         arr=s.array_elements, uid=s.systemtag))
+    module = dict(slot=0, module_type=("Inputs" if direction == "In" else "Outputs"),
+                  size=iface.max_bytes,
+                  direction="input" if direction == "In" else "output",
+                  global_start=0, signals=sigs)
+    edit = None
+    if edit_sig is not None:
+        edit = next((d for d in sigs if d["uid"] == edit_sig.systemtag), None)
+    return PnSignalForm(model, cfg, module, direction, start_byte=start_byte, edit=edit)
 
 
 # ------------------------------------------------------- Add (EtherNet/IP bits)
@@ -1085,6 +1238,8 @@ class EipAddForm(InspectorForm):
         self.count.setMinimum(1)
         form.addRow("Count", self.count)
         self.prefix = QLineEdit()
+        self._prefix_touched = False
+        self.prefix.textEdited.connect(lambda *_: setattr(self, "_prefix_touched", True))
         form.addRow("Name prefix", self.prefix)
         self.start = QSpinBox()
         self.start.setRange(0, 99999)
@@ -1112,6 +1267,8 @@ class EipAddForm(InspectorForm):
 
     def _free_bits(self):
         iface = self._iface()
+        # Both EtherCAT and EtherNet/IP have a fixed interface size (budget); Add fills the
+        # FREE bytes. Grow the interface first via Resize to make more room.
         return iface.max_bytes * 8 - iface.used_bits
 
     def _template(self):
@@ -1138,7 +1295,8 @@ class EipAddForm(InspectorForm):
         self.idx.setEnabled(insert)
         self.idx.setRange(0, max(0, len(iface.signals) - 1))
         dn = self.dtype.currentText()
-        self.prefix.setText(f"{iface.direction}_{dn}_")
+        if not self._prefix_touched:        # keep in sync with the type until user-edited
+            self.prefix.setText(f"{iface.direction}_{dn}_")
         self.count.setMaximum(max(1, self._free_bits() // self._per()))
         self._update_info()
 
@@ -1192,7 +1350,6 @@ class EipAddForm(InspectorForm):
         self.direction = iface.direction
         return (f"Added {len(new)} × {dn} to {iface.direction}. "
                 "Re-validate in SyCon.net before download.")
-
 
 # ==================================================================== the panel
 class InspectorPanel(QFrame):

@@ -200,11 +200,53 @@ def _nxd_info(paths) -> dict:
     return info
 
 
+def _load_eip_eis(paths, blob) -> ConfigModel:
+    """EtherNet/IP NETX 51 RE/EIS variant: signals are UTF-16 XML in the CFB stream
+    EISAdapterBasic (no appended detail block), the assembly SIZE is in CIPConnectBasic.
+    Full structural editing is supported via blob_eip (signal edits touch only that stream)."""
+    from .. import blob_eip
+    sigs = blob_eip.read_signals(blob)
+    in_max, out_max = blob_eip.assembly_sizes(blob)
+    in_sigs, out_sigs = [], []
+    for st, name, dtype, ae, ap, tag in sigs:
+        s = Signal(name=name, sycon_dtype=dtype, array_elements=int(ae or 1),
+                   systemtag=tag, signal_type=st, bit_offset=int(ap or 0) * 8)
+        (in_sigs if st == "input" else out_sigs).append(s)
+    dev = DeviceInfo(protocol="EtherNet/IP", base_name=paths.base_name)
+    sinfo = _station_info(paths, "EtherNet/IP", dev)
+    inp = Interface("In", max(in_max or 0, _direction_bytes(in_sigs)), signals=in_sigs)
+    out = Interface("Out", max(out_max or 0, _direction_bytes(out_sigs)), signals=out_sigs)
+    model = ConfigModel(dev, inp, out, raw={
+        "protocol_kind": "ethernetip",
+        "bit_addressed": True,
+        "eip_eis": True,                          # marker for the structural writer
+        # add/delete/edit/reorder are size-invariant (touch only EISAdapterBasic). Resize
+        # writes the size to the .nxd (@1141/@1181 + integrity MD5 = what the robot reads)
+        # and the blob CIPConnectBasic; the SyCon-internal configMD5 (= f(sizes)) is not
+        # reproduced -> re-validate a resize in SyCon.net (B1).
+        "structural": True, "reorderable": True, "resizable": True,
+        "paths": paths,
+        "orig_names": {s.systemtag: s.name for s in in_sigs + out_sigs},
+        **sinfo,
+    })
+    nx = _nxd_info(paths)
+    if nx:
+        model.raw["nxd"] = nx
+    if sinfo.get("config_md5"):
+        model.raw["config_md5"] = sinfo["config_md5"]
+    return model
+
+
 def load(paths) -> ConfigModel:
     xml = sycon.read_xml(paths.sycon_xml)
     blob = sycon.blob_from_xml(xml)
-    anchor, declen, detail = sycon.detail_block(blob)
+    # NETX 51 RE/EIS variant: signals are an XML in the CFB stream EISAdapterBasic (detection
+    # by the stream, NOT detail_block — for the clean format detail_block coincidentally
+    # succeeds, but its in-place byte-replace would corrupt the CFB; blob_eip rebuilds it).
+    if b"E\x00I\x00S\x00A\x00d\x00a\x00p\x00t\x00e\x00r" in blob:
+        return _load_eip_eis(paths, blob)
 
+    anchor, declen, detail = sycon.detail_block(blob)
     pairs = parse_signals(detail)
     in_sigs = [s for s, t in pairs if t == "input"]
     out_sigs = [s for s, t in pairs if t == "output"]
@@ -753,6 +795,8 @@ def write(model, paths) -> dict:
     raw['eip_skeleton'] = a SyCon-saved EtherNet/IP project of the TARGET size;
     its size-bearing parts (OLE2 lead, CIP tail, length fields, configMD5, .nxd)
     are reused and the current signals are injected into it (repacked)."""
+    if model.raw.get("eip_eis"):
+        return _eip_eis_write(model, paths)     # NETX 51 RE/EIS structural write
     skel = model.raw.get("eip_skeleton")
     base = skel or paths
     out = {"sycon": write_sycon(model, base.sycon_xml), "val3": None, "nxd": None}
@@ -760,6 +804,44 @@ def write(model, paths) -> dict:
         out["val3"] = write_val3(model, base.val3_xml)
     if base.nxd:                        # skeleton's .nxd already has target size
         out["nxd"] = base.nxd.read_bytes()
+    return out
+
+
+def _eip_eis_write(model, paths) -> dict:
+    """Full structural write for EtherNet/IP NETX 51 RE/EIS (BLOB IS MASTER). Reconciles the
+    signals in the blob's EISAdapterBasic XML to the model (add/delete/edit/reorder), mirrors
+    them into the Val3 ProcessData, keeps the .nxd (constant) and configMD5 (= f(sizes),
+    unchanged by signal edits). The .spj is metadata only. Signal edits within the assembly
+    size touch only EISAdapterBasic — SyCon-safe."""
+    from .. import blob_eip
+    from pathlib import Path
+
+    def desired(iface):
+        return [(s.systemtag, s.name, s.sycon_dtype, s.array_elements) for s in iface.signals]
+    din, dout = desired(model.inp), desired(model.out)
+    in_sz, out_sz = model.inp.max_bytes, model.out.max_bytes   # the assembly budget
+    out = {"sycon": None, "val3": None, "nxd": None}
+    # 1) BLOB (master): rebuild both directions' signals in EISAdapterBasic, then set the
+    #    assembly sizes (CIPConnectBasic) so SyCon shows the resized budget.
+    xml = sycon.read_xml(paths.sycon_xml)
+    blob = sycon.blob_from_xml(xml)
+    blob = blob_eip.set_direction_signals(blob, "input", din)
+    blob = blob_eip.set_direction_signals(blob, "output", dout)
+    blob = blob_eip.set_assembly_sizes(blob, in_sz, out_sz)
+    out["sycon"] = re.sub(r"(<BinData[^>]*>).*?(</BinData>)",
+                          lambda m: m.group(1) + bytes(blob).hex().upper() + m.group(2),
+                          xml, flags=re.S).encode("utf-8")
+    # 2) Val3 export: mirror the signals into the ProcessData <Module> (same XML format),
+    #    keep configMD5 (size-invariant for signal edits; SyCon-internal hash for resize)
+    if paths.val3_xml:
+        v = sycon.read_xml(paths.val3_xml)
+        v = blob_eip.rebuild_module_signals(v, "input", din)
+        v = blob_eip.rebuild_module_signals(v, "output", dout)
+        out["val3"] = v.encode("utf-8")
+    # 3) .nxd (what the robot reads): write the assembly sizes (@1141/@1181) + recompute the
+    #    netX integrity MD5. THIS is how the robot gets the resized size.
+    if paths.nxd:
+        out["nxd"] = blob_eip.set_nxd_sizes(Path(paths.nxd).read_bytes(), in_sz, out_sz)
     return out
 
 
@@ -812,6 +894,9 @@ def generic_load(paths, protocol: str):
         if ec_in is not None:
             in_max = max(in_bytes, ec_in)        # fixed image size from the .nxd
             out_max = max(out_bytes, ec_out)
+        # validated structural compiler (blob_ec): per-signal add/delete/edit/reorder +
+        # resize are SyCon-safe (delete + add confirmed open/save in SyCon.net 2026-06-16).
+        structural = reorderable = resizable = True
     inp = Interface("In", in_max, signals=in_sigs)
     out = Interface("Out", out_max, signals=out_sigs)
     model = ConfigModel(dev, inp, out, raw={
@@ -834,17 +919,28 @@ def generic_load(paths, protocol: str):
     # .nxd, endian from the Val3 byteOrder. Stored in raw for the General editor.
     if protocol == "PROFINET":
         from .. import nxd_pn
-        if paths.nxd and paths.nxd.is_file():
-            ch = nxd_pn.read_channel(paths.nxd.read_bytes())
-            if ch is not None:
-                model.raw["pn_startup"], model.raw["pn_watchdog"] = ch
-        if paths.nwid_nxd and paths.nwid_nxd.is_file():
+        # BLOB is the MASTER: read scalar device settings + name from the blob; fall back
+        # to the exports (.nxd / _nwid / Val3) only when the blob can't be read.
+        ds = _pn_blob_read_devsettings(blob)
+        if ds is not None:
+            model.raw["pn_startup"] = ds["startup"]
+            model.raw["pn_watchdog"] = ds["watchdog"]
+            model.raw["pn_endian_big"] = ds["endian_big"]
+            if "io_state" in ds:                 # IO State Information (Producer), read-only
+                model.raw["pn_io_state"] = ds["io_state"]
+        else:
+            if paths.nxd and paths.nxd.is_file():
+                ch = nxd_pn.read_channel(paths.nxd.read_bytes())
+                if ch is not None:
+                    model.raw["pn_startup"], model.raw["pn_watchdog"] = ch
+            model.raw["pn_endian_big"] = (sinfo.get("byte_order", "big") != "little")
+        nm = _pn_blob_read_name(blob)
+        if not nm and paths.nwid_nxd and paths.nwid_nxd.is_file():
             nm = nxd_pn.read_station_name(paths.nwid_nxd.read_bytes())
-            if nm:
-                dev.node_name = nm                   # authoritative station name
-                model.raw["station_fields"] = {"kind": "name", "name": nm}
+        if nm:
+            dev.node_name = nm                   # authoritative station name
+            model.raw["station_fields"] = {"kind": "name", "name": nm}
         model.raw["pn_orig_name"] = dev.node_name or ""   # for text-replace on write
-        model.raw["pn_endian_big"] = (sinfo.get("byte_order", "big") != "little")
         # detailed module map (slot, size, direction, global byte start, signals) for the
         # GUI's module bands + slot-bounded signal placement.
         try:
@@ -853,6 +949,26 @@ def generic_load(paths, protocol: str):
                 sycon.read_xml(paths.sycon_xml))
         except Exception:
             model.raw["pn_module_list"] = []
+    # EtherCAT "General Settings" scalars (Stufe 1): read from the export .nxd.
+    # EtherCAT-only path -> PROFINET/EIP/POWERLINK untouched.
+    if protocol == "EtherCAT":
+        # The SyCon project BLOB is the MASTER (the .nxd is only an export and can be
+        # stale). Read the General Settings from the blob; fall back to the .nxd only if
+        # the blob can't be read.
+        g = None
+        if paths.sycon_xml and paths.sycon_xml.is_file():
+            g = _ethercat_blob_read_general(
+                paths.sycon_xml.read_text(encoding="utf-8", errors="replace"))
+        if g is None and paths.nxd and paths.nxd.is_file():
+            from .. import nxd_ec
+            g = nxd_ec.read_general(paths.nxd.read_bytes())
+            if g is not None and paths.sycon_xml and paths.sycon_xml.is_file():
+                ios = _ethercat_blob_read_iostatus(
+                    paths.sycon_xml.read_text(encoding="utf-8", errors="replace"))
+                if ios is not None:
+                    g["io_data_status"] = ios
+        if g is not None:
+            model.raw["ec_general"] = g
     return model
 
 
@@ -985,6 +1101,69 @@ def _pn_blob_rename_signals(xml_text: str, renames):
     return new_xml, True
 
 
+def _pn_blob_read_devsettings(blob: bytes):
+    """Read PROFINET scalar device settings from the blob `PNIO_DeviceSettings` stream
+    (the MASTER): startup byte@2, watchdog u32@8, endian byte@14 (0=big, 1=little).
+    Returns {startup, watchdog, endian_big} or None. `blob` = the length-prefixed blob."""
+    import io as _io
+    import struct as _st
+    import olefile
+    try:
+        ole = olefile.OleFileIO(_io.BytesIO(blob[4:]))
+        if not ole.exists("PNIO_DeviceSettings"):
+            return None
+        ds = ole.openstream("PNIO_DeviceSettings").read()
+        if len(ds) < 15:
+            return None
+        r = {"startup": ds[2], "watchdog": _st.unpack_from("<I", ds, 8)[0],
+             "endian_big": ds[14] == 0}
+        if len(ds) > 32:
+            r["io_state"] = ds[32]      # IO State Information enum (0=Disabled,1=Bit,2=Byte)
+        return r
+    except Exception:
+        return None
+
+
+def _pn_blob_read_name(blob: bytes):
+    """Read the PROFINET device/station name from the blob `PNIODeviceDataModelBasic`
+    stream (the MASTER): u32 byte-length @6, utf-16 name @10. Returns the name or None."""
+    import io as _io
+    import struct as _st
+    import olefile
+    try:
+        ole = olefile.OleFileIO(_io.BytesIO(blob[4:]))
+        if not ole.exists("PNIODeviceDataModelBasic"):
+            return None
+        d = ole.openstream("PNIODeviceDataModelBasic").read()
+        ln = _st.unpack_from("<I", d, 6)[0]
+        if ln <= 0 or 10 + ln > len(d):
+            return None
+        return d[10:10 + ln].decode("utf-16-le", "replace").rstrip("\x00") or None
+    except Exception:
+        return None
+
+
+def _eip_blob_read_ip(blob: bytes):
+    """EtherNet/IP: read the adapter IP from the blob (the MASTER) — CFB stream
+    `CahedAdapter/ENIPIpSettings/ENIPIpSettingsBasic` (u32 byte-length @6, utf-16 IP
+    string @10; note Hilscher's stream-name typo 'Cahed'). Returns the IP or None."""
+    import io as _io
+    import struct as _st
+    import olefile
+    try:
+        ole = olefile.OleFileIO(_io.BytesIO(blob[4:]))
+        p = "CahedAdapter/ENIPIpSettings/ENIPIpSettingsBasic"
+        if not ole.exists(p):
+            return None
+        d = ole.openstream(p).read()
+        ln = _st.unpack_from("<I", d, 6)[0]
+        if ln <= 0 or 10 + ln > len(d):
+            return None
+        return d[10:10 + ln].decode("utf-16-le", "replace").rstrip("\x00") or None
+    except Exception:
+        return None
+
+
 def _pn_blob_patch_devsettings(xml_text: str, off: int, fmt: str, value) -> str:
     """Patch a fixed-size field in the blob's `PNIO_DeviceSettings` CFB stream (42 B,
     SAME size -> olefile writes it in place, no resize). Used for watchdog (u32 @8)
@@ -1077,12 +1256,15 @@ def _pn_scalar_write(model, paths) -> dict:
     # main.nxd CHANNEL block (startup byte + watchdog u32) / per-submodule endian flags
     # + blob PNIO_DeviceSettings (startup byte @2, watchdog u32 @8, endian byte @14:
     # 0=big/1=little) + Val3 (byteOrder + configMD5 = new main.nxd MD5). ---
+    su = model.raw.get("pn_startup")
+    wd = model.raw.get("pn_watchdog")
+    big = model.raw.get("pn_endian_big")
+    # --- main.nxd export: SELF-HEAL startup/watchdog/endian to the desired values
+    # (diff vs the .nxd; it may be stale -> brings it up to `desired`). Val3 configMD5
+    # follows the new .nxd MD5. ---
     if paths.nxd and paths.nxd.is_file():
         orig_nxd = paths.nxd.read_bytes()
         new_nxd = orig_nxd
-        su = model.raw.get("pn_startup")
-        wd = model.raw.get("pn_watchdog")
-        big = model.raw.get("pn_endian_big")
         cur = nxd_pn.read_channel(orig_nxd)
         su_chg = su is not None and cur is not None and cur[0] != (1 if su else 0)
         wd_chg = wd is not None and cur is not None and cur[1] != int(wd)
@@ -1090,34 +1272,94 @@ def _pn_scalar_write(model, paths) -> dict:
             new_nxd = nxd_pn.patch_channel(new_nxd,
                                            (1 if su else 0) if su is not None else cur[0],
                                            int(wd) if wd is not None else cur[1])
-        en_chg = big is not None and nxd_pn.read_endian_big(new_nxd) != bool(big)
-        if en_chg:
+        if big is not None and nxd_pn.read_endian_big(new_nxd) != bool(big):
             new_nxd = nxd_pn.patch_endian(new_nxd, bool(big))
         if new_nxd != orig_nxd:
             out["nxd"] = new_nxd
             old_md5, new_md5 = nxd_pn.md5_hex(orig_nxd), nxd_pn.md5_hex(new_nxd)
-            if blob_txt is not None:
-                if su_chg:
-                    blob_txt = _pn_blob_patch_devsettings(blob_txt, 2, "<B",
-                                                          1 if su else 0)
-                if wd_chg:
-                    blob_txt = _pn_blob_patch_devsettings(blob_txt, 8, "<I", int(wd))
-                if en_chg:
-                    blob_txt = _pn_blob_patch_devsettings(blob_txt, 14, "<B",
-                                                          0 if big else 1)
             v = (out["val3"].decode("utf-8") if out["val3"] is not None else
                  (paths.val3_xml.read_text(encoding="utf-8", errors="replace")
                   if paths.val3_xml and paths.val3_xml.is_file() else None))
-            if v is not None:
-                if en_chg:
-                    v = re.sub(r'(byteOrder=")[^"]*(")', lambda m: m.group(1)
-                               + ("big" if big else "little") + m.group(2), v, count=1)
-                if old_md5 != new_md5:
-                    v = v.replace(f'configMD5="{old_md5}"', f'configMD5="{new_md5}"')
-                out["val3"] = v.encode("utf-8")
+            if v is not None and old_md5 != new_md5:
+                out["val3"] = v.replace(f'configMD5="{old_md5}"',
+                                        f'configMD5="{new_md5}"').encode("utf-8")
+    # --- blob PNIO_DeviceSettings: BLOB IS MASTER -> diff vs the BLOB's own values,
+    # independent of the .nxd (a stale .nxd whose value == desired must NOT skip the
+    # blob write — the watchdog/sync-class bug). startup@2 / watchdog@8 / endian@14. ---
+    if blob_txt is not None:
+        cb = _pn_blob_read_devsettings(sycon.blob_from_xml(blob_txt))
+        if cb is not None:
+            if su is not None and (1 if su else 0) != cb["startup"]:
+                blob_txt = _pn_blob_patch_devsettings(blob_txt, 2, "<B", 1 if su else 0)
+            if wd is not None and int(wd) != cb["watchdog"]:
+                blob_txt = _pn_blob_patch_devsettings(blob_txt, 8, "<I", int(wd))
+            if big is not None and bool(big) != cb["endian_big"]:
+                blob_txt = _pn_blob_patch_devsettings(blob_txt, 14, "<B", 0 if big else 1)
+    # --- Val3 byteOrder export: reflect the desired endian (diff vs current) ---
+    if big is not None:
+        v = (out["val3"].decode("utf-8") if out["val3"] is not None else
+             (paths.val3_xml.read_text(encoding="utf-8", errors="replace")
+              if paths.val3_xml and paths.val3_xml.is_file() else None))
+        if v is not None:
+            want = "big" if big else "little"
+            cbo = re.search(r'byteOrder="([^"]*)"', v)
+            if cbo and cbo.group(1) != want:
+                out["val3"] = re.sub(r'(byteOrder=")[^"]*(")',
+                                     lambda m: m.group(1) + want + m.group(2),
+                                     v, count=1).encode("utf-8")
 
     if blob_txt is not None:
         out["sycon"] = blob_txt.encode("utf-8")
+    return out
+
+
+def _ethercat_structural_write(model, paths) -> dict:
+    """Full EtherCAT structural write (BLOB IS MASTER). Reconciles the blob's signals to the
+    model's desired list per direction (add/delete/edit/reorder/resize, systemTag travels)
+    via blob_ec.set_direction_signals, mirrors it into the export .nxd, applies any changed
+    General Settings, and refreshes the Val3 export (signal labels + configMD5 = new .nxd
+    MD5). The .spj is metadata only and untouched (SyCon reads _S129/SYCON_net.xml)."""
+    import hashlib
+    from pathlib import Path
+    from .. import blob_ec
+    def desired(iface):
+        # EtherCAT GUIDs are upper-case in the blob/.nxd; the systemTag travels with the
+        # signal (preserved on edit/reorder, fresh only for a newly added signal).
+        return [(s.systemtag.upper(), s.name, s.sycon_dtype, s.array_elements)
+                for s in iface.signals]
+    din, dout = desired(model.inp), desired(model.out)
+    in_sz, out_sz = model.inp.max_bytes, model.out.max_bytes   # configured size (may be > used)
+    out = {"sycon": None, "val3": None, "nxd": None}
+    # 1) BLOB (master): rebuild both directions (SM length = configured size, trailing free
+    #    bytes kept), write back into <BinData>
+    xml = sycon.read_xml(paths.sycon_xml)
+    blob = sycon.blob_from_xml(xml)
+    blob = blob_ec.set_direction_signals(blob, "input", din, size_bytes=in_sz)
+    blob = blob_ec.set_direction_signals(blob, "output", dout, size_bytes=out_sz)
+    # 2) export .nxd: same reconcile, then stamp the configured process-image size
+    if paths.nxd:
+        import struct as _st
+        nxd = Path(paths.nxd).read_bytes()
+        nxd = blob_ec.set_direction_signals_nxd(nxd, "input", din)
+        nxd = blob_ec.set_direction_signals_nxd(nxd, "output", dout)
+        nxd = bytearray(nxd)
+        _st.pack_into("<H", nxd, 380, in_sz)       # In  process-image size (>= used)
+        _st.pack_into("<H", nxd, 408, out_sz)      # Out process-image size (>= used)
+        nxd[0x54:0x54 + 16] = hashlib.md5(bytes(nxd[136:])).digest()
+        out["nxd"] = bytes(nxd)
+    out["sycon"] = re.sub(r"(<BinData[^>]*>).*?(</BinData>)",
+                          lambda m: m.group(1) + bytes(blob).hex().upper() + m.group(2),
+                          xml, flags=re.S).encode("utf-8")
+    # 3) General Settings (in-place on the rebuilt blob/.nxd) — EtherCAT-only
+    out = _ethercat_apply_general(model, out)
+    # 4) Val3 export: signal labels + configMD5 = MD5 of the final .nxd data
+    if paths.val3_xml:
+        out["val3"] = write_val3(model, paths.val3_xml)
+        if out.get("nxd") is not None:
+            new_md5 = hashlib.md5(out["nxd"][136:]).hexdigest().upper()
+            v = out["val3"].decode("utf-8", "replace")
+            out["val3"] = re.sub(r'configMD5="[^"]*"', f'configMD5="{new_md5}"',
+                                 v).encode("utf-8")
     return out
 
 
@@ -1129,6 +1371,8 @@ def generic_write(model, paths) -> dict:
     # skeleton (size unchanged) and the .nxd is copied verbatim.
     if model.raw.get("protocol_kind") == "profinet":
         return _pn_scalar_write(model, paths)
+    if model.raw.get("protocol_kind") == "ethercat":
+        return _ethercat_structural_write(model, paths)
     skel = model.raw.get("ec_skeleton") or model.raw.get("pn_skeleton")
     base = skel or paths
     out = {"sycon": write_sycon(model, base.sycon_xml), "val3": None, "nxd": None}
@@ -1141,9 +1385,165 @@ def generic_write(model, paths) -> dict:
             # no skeleton needed. A no-op resize reproduces the file byte-exact.
             out["nxd"] = _ethercat_nxd_resized(base.nxd, model.inp.max_bytes,
                                                model.out.max_bytes)
+            out = _ethercat_apply_general(model, out)   # General Settings (Stufe 1)
         else:
             out["nxd"] = base.nxd.read_bytes()
     return out
+
+
+def _ethercat_apply_general(model, out) -> dict:
+    """Apply changed EtherCAT "General Settings" to the outputs. EtherCAT-only — never
+    touches PROFINET/EIP/POWERLINK. Desired values live in model.raw['ec_general'].
+    Two classes of field:
+      • .nxd fields (startup/watchdog/vendor/product/revision/serial/sync/alias): patched
+        byte-exact in out['nxd'] + the new configMD5 into out['val3'] + the blob.
+      • io_data_status: BLOB-ONLY (no .nxd representation -> no robot effect via the
+        export) -> patched only in the SyCon project blob (ECTDeviceBasic @262)."""
+    from .. import nxd_ec
+    desired = model.raw.get("ec_general")
+    nxd = out.get("nxd")
+    if not desired or not nxd:
+        return out
+    cur = nxd_ec.read_general(nxd)
+    if cur is None:
+        return out
+    # .nxd: patch fields that differ from the .nxd (stale .nxd self-heals to `desired`).
+    nxd_changed = {k: desired[k] for k in cur if k in desired and desired[k] != cur[k]}
+    # BLOB is the MASTER -> diff the blob fields against the BLOB's OWN current values,
+    # NOT against the .nxd (the .nxd can be stale, so diffing vs it misses a field whose
+    # desired value happens to equal the stale .nxd but differs from the blob — exactly
+    # what dropped watchdog/sync from the blob write).
+    blob_changed = {}
+    if out.get("sycon") is not None:
+        cur_blob = _ethercat_blob_read_general(out["sycon"].decode("utf-8", "replace")) or {}
+        for k in ("bus_startup", "watchdog_ms", "station_alias",
+                  "io_data_status", "sync_x10ns"):
+            if k in desired and desired.get(k) != cur_blob.get(k):
+                blob_changed[k] = desired[k]
+    if not nxd_changed and not blob_changed:
+        return out
+    if nxd_changed:
+        old_md5 = nxd_ec.md5_hex(nxd)
+        out["nxd"] = nxd_ec.patch_general(nxd, nxd_changed)
+        new_md5 = nxd_ec.md5_hex(out["nxd"])
+        if out.get("val3") is not None and old_md5 != new_md5:
+            out["val3"] = out["val3"].decode("utf-8", "replace").replace(
+                f'configMD5="{old_md5}"', f'configMD5="{new_md5}"').encode("utf-8")
+    if blob_changed and out.get("sycon") is not None:
+        try:
+            out["sycon"] = _ethercat_blob_patch_general(
+                out["sycon"].decode("utf-8", "replace"), blob_changed).encode("utf-8")
+        except Exception:
+            pass        # blob stays identity; robot uses the .nxd regardless
+    return out
+
+
+def _ethercat_blob_read_general(xml_text: str):
+    """Read ALL EtherCAT General Settings from the SyCon project blob — the MASTER
+    (what SyCon edits and treats as authoritative; the .nxd is only an export that can
+    go stale). Scalars from `CachedSlave/ECTDeviceBasic`; ident from the DeviceIdentity
+    streams (Vendor/ECTVendorBasic @8, ECTDeviceIdentityBasic product @8 / revision @16).
+    Returns dict (same keys as nxd_ec.read_general + io_data_status) or None."""
+    import io as _io
+    import struct as _struct
+    from .. import cfb_write
+    import olefile
+    m = re.search(r"<BinData[^>]*>([0-9A-Fa-f\s]+)</BinData>", xml_text)
+    if not m:
+        return None
+    try:
+        cfb = bytes.fromhex("".join(m.group(1).split()))[4:]
+        T = cfb_write.read_tree(olefile.OleFileIO(_io.BytesIO(cfb)))
+    except Exception:
+        return None
+    cs = T.get("CachedSlave")
+    dev = cs.get("ECTDeviceBasic") if isinstance(cs, dict) else None
+    if not isinstance(dev, (bytes, bytearray)) or len(dev) < 280:
+        return None
+    di = cs.get("DeviceIdentity") if isinstance(cs, dict) else None
+    di = di if isinstance(di, dict) else {}
+    idb = di.get("ECTDeviceIdentityBasic")
+    vnd = (di.get("Vendor") or {}).get("ECTVendorBasic") if isinstance(di.get("Vendor"), dict) else None
+    u32 = lambda b, o: _struct.unpack_from("<I", b, o)[0]
+    return {
+        "bus_startup":    u32(dev, 238),
+        "watchdog_ms":    u32(dev, 246),
+        "station_alias":  u32(dev, 254),
+        "io_data_status": u32(dev, 262),
+        "sync_x10ns":     _struct.unpack_from("<H", dev, 276)[0],
+        "vendor_id":      u32(vnd, 8) if isinstance(vnd, (bytes, bytearray)) and len(vnd) >= 12 else 0,
+        "product_code":   u32(idb, 8) if isinstance(idb, (bytes, bytearray)) and len(idb) >= 12 else 0,
+        "revision":       u32(idb, 16) if isinstance(idb, (bytes, bytearray)) and len(idb) >= 20 else 0,
+        "serial":         0,
+    }
+
+
+def _ethercat_blob_read_iostatus(xml_text: str):
+    """Read I/O Data Status (blob-only, ECTDeviceBasic @262) from the SyCon project
+    blob, or None. 0 = None; nonzero = a status mode."""
+    import io as _io
+    import struct as _struct
+    from .. import cfb_write
+    import olefile
+    m = re.search(r"<BinData[^>]*>([0-9A-Fa-f\s]+)</BinData>", xml_text)
+    if not m:
+        return None
+    try:
+        cfb = bytes.fromhex("".join(m.group(1).split()))[4:]
+        tree = cfb_write.read_tree(olefile.OleFileIO(_io.BytesIO(cfb)))
+        dev = tree.get("CachedSlave", {}).get("ECTDeviceBasic")
+        if isinstance(dev, (bytes, bytearray)) and len(dev) >= 266:
+            return _struct.unpack_from("<I", dev, 262)[0]
+    except Exception:
+        return None
+    return None
+
+
+def _ethercat_blob_patch_general(xml_text: str, changed: dict) -> str:
+    """Patch the EtherCAT General-Settings scalars in the SyCon project blob IN PLACE,
+    so re-opening in SyCon shows the new values. The settings live in the CFB stream
+    `CachedSlave/ECTDeviceBasic` (startup u32@238, watchdog u32@246, alias u32@254,
+    I/O Data Status u32@262, sync u16@276); `ECATDataModelBasic`[90] -> 9 (the 'model
+    edited' marker). We patch the SAME-SIZE bytes directly in the raw CFB (located via
+    the stream content, which is contiguous + unique) — NO cfb rebuild — so the blob
+    stays BYTE-IDENTICAL to SyCon's original except those few setting bytes (SyCon
+    accepts it for sure). Returns the input unchanged if the blob/stream isn't found."""
+    import io as _io
+    import struct as _struct
+    import olefile
+    m = re.search(r"(<BinData[^>]*>)([0-9A-Fa-f\s]+)(</BinData>)", xml_text)
+    if not m:
+        return xml_text
+    raw = bytearray(bytes.fromhex("".join(m.group(2).split())))
+    cfb = bytes(raw[4:])                            # raw[:4] = u32 CFB byte length
+    try:
+        ole = olefile.OleFileIO(_io.BytesIO(cfb))
+        dev = ole.openstream("CachedSlave/ECTDeviceBasic").read()
+        dm = ole.openstream("ECATDataModelBasic").read()
+    except Exception:
+        return xml_text
+    if len(dev) < 280:
+        return xml_text
+    # locate ECTDeviceBasic content contiguously + uniquely in the raw CFB
+    dpos = cfb.find(dev[:64])
+    if dpos < 0 or cfb.count(dev[:64]) != 1 or cfb[dpos:dpos + len(dev)] != dev:
+        return xml_text                            # not safely locatable -> bail
+    base = 4 + dpos                                 # offset into `raw`
+    def w32(off, v): _struct.pack_into("<I", raw, base + off, int(v) & 0xFFFFFFFF)
+    def w16(off, v): _struct.pack_into("<H", raw, base + off, int(v) & 0xFFFF)
+    if "bus_startup" in changed:    w32(238, 1 if changed["bus_startup"] else 0)
+    if "watchdog_ms" in changed:    w32(246, changed["watchdog_ms"])
+    if "station_alias" in changed:  w32(254, changed["station_alias"])
+    if "io_data_status" in changed: w32(262, changed["io_data_status"])
+    if "sync_x10ns" in changed:     w16(276, changed["sync_x10ns"])
+    # ECATDataModelBasic[90] = 9 (edited marker), also in place
+    mpos = cfb.find(dm[:40])
+    if len(dm) > 90 and mpos >= 0 and cfb.count(dm[:40]) == 1 and cfb[mpos:mpos + len(dm)] == dm:
+        raw[4 + mpos + 90] = 9
+    new_hex = bytes(raw).hex()                      # same length -> u32 prefix unchanged
+    if any(c in "ABCDEF" for c in m.group(2)):
+        new_hex = new_hex.upper()
+    return xml_text[:m.start(2)] + new_hex + xml_text[m.end(2):]
 
 
 def ec_skeleton_sizes(skeleton_paths) -> tuple[int, int]:
