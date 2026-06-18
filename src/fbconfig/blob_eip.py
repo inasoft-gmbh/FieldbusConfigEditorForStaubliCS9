@@ -120,23 +120,31 @@ def rebuild_module_signals(xml: str, direction: str, desired) -> str:
     old_by_tag = {tag(b.group(0)): b.group(0) for b in blocks}
     keep = [b.group(0) for b in blocks if styp(b.group(0)) != direction]   # other direction
 
-    new_blocks, access = [], 0
+    # BIT cursor — replicates Interface.repack_bits (bits pack tight, value types
+    # byte-aligned). A single sub-byte bit (arrayElements=1) lands at its real bit offset
+    # (6103) with a "byte.bit" accessPath instead of all bits stacking at byte 0; byte-aligned
+    # signals are unchanged (byte = cur//8, 6103 = byte*8).
+    new_blocks, cur = [], 0
     for t, name, dtype, ae in desired:
         ae = int(ae)
-        width = bit_width(dtype, ae) // 8       # bytes (all data types, incl. signed/dword)
+        if dtype != "bit" and cur % 8:               # byte-align value types
+            cur += 8 - (cur % 8)
+        wbits = bit_width(dtype, ae)
+        byte, bit = cur // 8, cur % 8
+        ap = str(byte) if bit == 0 else f"{byte}.{bit}"
         blk = old_by_tag.get(t, template)
         blk = _set_attr(blk, "systemTag", t)
         blk = _set_attr(blk, "displayName", name)
         blk = _set_attr(blk, "signalType", direction)
         blk = _set_attr(blk, "dataType", dtype)
         blk = _set_attr(blk, "arrayElements", str(ae))
-        blk = _set_attr(blk, "signalAccessPath", str(access))
+        blk = _set_attr(blk, "signalAccessPath", ap)
         if t not in old_by_tag:
             blk = _set_prop(blk, "6100", _fresh_6100())
         blk = _set_prop(blk, "6103",
-                        base64.b64encode(struct.pack("<I", access * 8)).decode("ascii"))
+                        base64.b64encode(struct.pack("<I", cur)).decode("ascii"))
         new_blocks.append(blk)
-        access += width
+        cur += wbits
 
     # reassemble: module props + input signals + output signals (stable order)
     ins = (new_blocks if direction == "input" else

@@ -209,8 +209,9 @@ def _load_eip_eis(paths, blob) -> ConfigModel:
     in_max, out_max = blob_eip.assembly_sizes(blob)
     in_sigs, out_sigs = [], []
     for st, name, dtype, ae, ap, tag in sigs:
+        # accessPath is a byte number ("8") or, for a sub-byte bit, "byte.bit" ("0.1")
         s = Signal(name=name, sycon_dtype=dtype, array_elements=int(ae or 1),
-                   systemtag=tag, signal_type=st, bit_offset=int(ap or 0) * 8)
+                   systemtag=tag, signal_type=st, bit_offset=_bitoff_from_accesspath(ap or "0"))
         (in_sigs if st == "input" else out_sigs).append(s)
     dev = DeviceInfo(protocol="EtherNet/IP", base_name=paths.base_name)
     sinfo = _station_info(paths, "EtherNet/IP", dev)
