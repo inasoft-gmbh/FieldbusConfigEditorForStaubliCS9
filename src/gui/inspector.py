@@ -934,6 +934,11 @@ class PnSignalForm(InspectorForm):
         self.edit_set = list(edit_set) if edit_set else None  # several signals -> rebuild
         self._span_bytes = span_bytes              # selected byte span -> default count
         self._edit_uids = []                       # UIDs to keep, in order (multi-edit)
+        self._unit_arr = 1                         # arrayElements per generated signal
+        #                                            (a multi-edit of byte-packed bits or
+        #                                            arrays keeps the selection's element
+        #                                            count, so a name-only edit keeps the
+        #                                            exact signals + UIDs).
         # The flat protocols (EtherCAT / EtherNet/IP / POWERLINK) reuse this EXACT page —
         # the whole direction is one synthetic slot; only the header text + apply() target
         # differ (model rebuild vs the PROFINET blob writer). PROFINET keeps the slot model.
@@ -972,6 +977,7 @@ class PnSignalForm(InspectorForm):
             self._edit_uids = [s.get("uid") for s in sset]
             self.dtype.setCurrentText(sset[0]["dtype"])
             self.arr_cb.setChecked(False)          # separate values
+            self._unit_arr = sset[0].get("arr", 1) or 1   # keep the selection's elem count
             self.count.setValue(len(sset))         # initial = the selection's signal count
             self._span_bytes = self._footprint_bytes(sset)   # type change re-derives count
             self.startb.setValue(min(sset[0]["byte"], module["size"] - 1))
@@ -1073,6 +1079,7 @@ class PnSignalForm(InspectorForm):
         # (4 B selected -> byte 4, bit 32, word 2, real32 1). Only when a span/selection
         # drove the count (plain Add without a selection keeps the user's count).
         if self._span_bytes > 0:
+            self._unit_arr = 1                     # a new type starts from single elements
             self._apply_span()                     # setValue -> _recompute fires
         self._recompute()
 
@@ -1089,13 +1096,17 @@ class PnSignalForm(InspectorForm):
         return self._dt() == "bit"
 
     def _nbytes(self):
-        """Byte footprint inside the slot for the current selection."""
+        """Byte footprint inside the slot for the current selection. In separate mode each
+        of the `n` signals carries `_unit_arr` elements (1 normally; a multi-edit of
+        byte-packed bits / arrays keeps the selection's element count). Array mode is one
+        signal whose length is the count."""
         n = self.count.value()
+        k = self._unit_arr if self._is_sep() else 1
         if self._is_bit():
-            # separate: n single bits packed into whole bytes; array: n bytes (×8 bits)
-            return (n + 7) // 8 if self._is_sep() else n
+            # separate: n signals × k bits, packed into whole bytes; array: n bytes (×8)
+            return (n * k + 7) // 8 if self._is_sep() else n
         each = _SIG_BITS[self._dt()] // 8
-        return n * each
+        return n * each * k if self._is_sep() else n * each
 
     def _occupied(self):
         bits = set()
@@ -1109,8 +1120,12 @@ class PnSignalForm(InspectorForm):
         m = self.module
         dt = self._dt()
         sep = self._is_sep()
+        packed = sep and self._unit_arr % 8 == 0     # each signal is whole byte(s) of bits
         if self._is_bit():
-            self.count_lbl.setText("Count (bits, ×8)" if sep else "Array length (bytes)")
+            if packed:                               # multi-edit of byte-packed bit signals
+                self.count_lbl.setText("Count (signals)")
+            else:
+                self.count_lbl.setText("Count (bits, ×8)" if sep else "Array length (bytes)")
         else:
             self.count_lbl.setText("Count" if sep else "Array length")
         # auto-suggest a name prefix from direction + data type, and KEEP it in sync with the
@@ -1123,7 +1138,10 @@ class PnSignalForm(InspectorForm):
         nbytes = self._nbytes()
         new_bits = nbytes * 8
         base_bit = start * 8
-        bit_ok = (not self._is_bit()) or (not sep) or (self.count.value() % 8 == 0)
+        # separate single bits must come in whole bytes; byte-packed bit signals
+        # (_unit_arr multiple of 8) are already whole bytes, so any count is fine.
+        bit_ok = (not self._is_bit()) or (not sep) or packed \
+            or (self.count.value() % 8 == 0)
         in_slot = start + nbytes <= m["size"]
         overlap = bool(self._occupied() & set(range(base_bit, base_bit + new_bits)))
         self._ok = nbytes > 0 and in_slot and not overlap and bit_ok
@@ -1186,16 +1204,19 @@ class PnSignalForm(InspectorForm):
         def sep_name(i, total):
             return (prefix.rstrip("_") or scheme.name(i)) if total == 1 else scheme.name(i)
 
+        k = self._unit_arr                           # elements per signal (1 normally)
         new = []
         if self._is_bit() and self._is_sep():
-            for i in range(n):                       # n single bits, byte.bit
+            cur = start * 8                          # n signals of k bits each, packed
+            for i in range(n):
                 new.append(dict(name=sep_name(i, n), dtype="bit",
-                                byte=start + i // 8, bit=i % 8, arr=1))
+                                byte=cur // 8, bit=cur % 8, arr=k))
+                cur += k
         elif self._is_sep():
-            each = _SIG_BITS[dt] // 8
-            for i in range(n):                       # n separate values
+            each = (_SIG_BITS[dt] // 8) * k           # bytes one signal occupies
+            for i in range(n):                       # n separate values / arrays
                 new.append(dict(name=sep_name(i, n), dtype=dt,
-                                byte=start + i * each, bit=0, arr=1))
+                                byte=start + i * each, bit=0, arr=k))
         else:                                        # one array signal
             arr = n * 8 if self._is_bit() else n
             name = prefix.rstrip("_") or f"{_type_label(dt)}_array"

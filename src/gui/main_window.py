@@ -1837,7 +1837,7 @@ class MainWindow(QMainWindow):
             return None
         if len({s["dtype"] for s in sigs}) != 1:
             return None
-        if any(s.get("arr", 1) != 1 for s in sigs):
+        if len({(s.get("arr", 1) or 1) for s in sigs}) != 1:
             return None
         # contiguous within the slot: consecutive positions in the slot's byte-sorted list
         occ = sorted(module["signals"], key=lambda s: (s["byte"], s.get("bit", 0)))
@@ -1917,14 +1917,15 @@ class MainWindow(QMainWindow):
         self._status(f"Renamed to '{new}'.", "success")
 
     def _homogeneous_contiguous(self, iface, idxs):
-        """True if the selected signals are all the SAME data type, all plain values
-        (arrayElements==1) and a CONTIGUOUS run (no other signal between them) — the
-        precondition for the full multi-edit page. Signals are stored byte-sorted, so a
-        contiguous run is a block of consecutive model indices."""
+        """True if the selected signals are the SAME kind — identical data type AND
+        identical arrayElements — and a CONTIGUOUS run (no other signal between them):
+        the precondition for the full multi-edit page. Signals are stored byte-sorted, so
+        a contiguous run is a block of consecutive model indices. (Mixed type/elements or
+        a gap -> the batch-rename dialog instead.)"""
         sigs = [iface.signals[i] for i in idxs]
         if len({s.sycon_dtype for s in sigs}) != 1:
             return False
-        if any((s.array_elements or 1) != 1 for s in sigs):
+        if len({(s.array_elements or 1) for s in sigs}) != 1:
             return False
         return sorted(idxs) == list(range(min(idxs), min(idxs) + len(idxs)))
 
