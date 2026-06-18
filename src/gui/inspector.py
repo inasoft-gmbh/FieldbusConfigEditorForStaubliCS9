@@ -224,7 +224,7 @@ class AddForm(InspectorForm):
         # keep the auto-suggested name in sync with the data type — until the user edits it
         if separate or single_bit:
             if not self._prefix_touched:
-                base = 'bit' if single_bit else dname
+                base = 'bit' if single_bit else _type_label(dname)
                 self.prefix.setText(f"{iface.direction}_{base}_")
         else:
             if dt.key == "bit":
@@ -232,7 +232,7 @@ class AddForm(InspectorForm):
             else:
                 self.arr_len_lbl.setText(f"Array length (number of {dname})")
             if not self._arr_name_touched:
-                self.arr_name.setText(f"{iface.direction}_{dname}_array")
+                self.arr_name.setText(f"{iface.direction}_{_type_label(dname)}_array")
 
         nbytes = self._nbytes()
         if single_bit:
@@ -307,7 +307,7 @@ class AddForm(InspectorForm):
             return (f"Added {count} × {dname} at byte {start} ({iface.direction}). "
                     f"{iface.used_bytes}/{iface.max_bytes} used.")
         arr = self.arr_len.value() * 8 if dt.key == "bit" else self.arr_len.value()
-        name = self.arr_name.text().strip() or f"{iface.direction}_{dname}_array"
+        name = self.arr_name.text().strip() or f"{iface.direction}_{_type_label(dname)}_array"
         self.cfg["last_type"], self.cfg["last_mode"] = dname, "array"
         settings.save(self.cfg)
         s = Sig(name, dname, array_elements=arr)
@@ -768,6 +768,14 @@ _SIG_BITS = {"bit": 1, "byte": 8, "signed8": 8, "unsigned8": 8,
 _SIG_DTYPES = list(_SIG_BITS.items())
 
 
+def _type_label(dtype: str) -> str:
+    """Name-prefix label for a data type with the bit-width digits stripped, so the
+    auto-suggested prefix reads 'In_real_' not 'In_real32_' (real32->real, signed8->
+    signed, unsigned16->unsigned; bit/byte/word/dword unchanged). Applies to every data
+    type and every bus protocol's add/edit form."""
+    return dtype.rstrip("0123456789") or dtype
+
+
 def _derive_naming(names):
     """(prefix, numbering-start, digits) inferred from existing signal names so a
     multi-row Edit pre-fills exactly the selection's scheme. Uses the FIRST name's
@@ -964,7 +972,8 @@ class PnSignalForm(InspectorForm):
             self._edit_uids = [s.get("uid") for s in sset]
             self.dtype.setCurrentText(sset[0]["dtype"])
             self.arr_cb.setChecked(False)          # separate values
-            self.count.setValue(len(sset))
+            self.count.setValue(len(sset))         # initial = the selection's signal count
+            self._span_bytes = self._footprint_bytes(sset)   # type change re-derives count
             self.startb.setValue(min(sset[0]["byte"], module["size"] - 1))
             pfx, ns, dg = _derive_naming([s["name"] for s in sset])
             self.prefix.setText(pfx)
@@ -977,9 +986,16 @@ class PnSignalForm(InspectorForm):
                 self._apply_span()
         self._recompute()
 
+    @staticmethod
+    def _footprint_bytes(sigs):
+        """Byte span covered by a (homogeneous, contiguous) signal set — the LENGTH a
+        multi-edit hands to the count when the data type is switched."""
+        bits = sum(_SIG_BITS[s["dtype"]] * (s.get("arr", 1) or 1) for s in sigs)
+        return max(1, (bits + 7) // 8)
+
     def _apply_span(self):
-        """Take the selected byte span as the default LENGTH: count = span ÷ type width
-        (floor; the leftover is flagged in _recompute). Bits fill the span (×8)."""
+        """Take the selected byte span as the LENGTH: count = span ÷ type width (floor;
+        the leftover is flagged in _recompute). Bits fill the span (×8)."""
         dt = self._dt()
         if dt == "bit":
             self.count.setValue(max(1, self._span_bytes * 8))
@@ -1047,10 +1063,18 @@ class PnSignalForm(InspectorForm):
         root.addWidget(self.warn)
         root.addStretch()
 
-        self.dtype.currentIndexChanged.connect(self._recompute)
+        self.dtype.currentIndexChanged.connect(self._on_type_changed)
         self.arr_cb.toggled.connect(self._recompute)
         for sb in (self.startb, self.count):
             sb.valueChanged.connect(self._recompute)
+
+    def _on_type_changed(self, *_):
+        # the selected byte LENGTH stays fixed; the count follows the new data type
+        # (4 B selected -> byte 4, bit 32, word 2, real32 1). Only when a span/selection
+        # drove the count (plain Add without a selection keeps the user's count).
+        if self._span_bytes > 0:
+            self._apply_span()                     # setValue -> _recompute fires
+        self._recompute()
 
     def _mark_prefix_touched(self, *_):
         self._prefix_touched = True
@@ -1092,7 +1116,8 @@ class PnSignalForm(InspectorForm):
         # auto-suggest a name prefix from direction + data type, and KEEP it in sync with the
         # type — until the user edits it themselves (then leave their text alone).
         if not self._prefix_touched:
-            self.prefix.setText(f"{'In' if m['direction'] == 'input' else 'Out'}_{dt}_")
+            io = 'In' if m['direction'] == 'input' else 'Out'
+            self.prefix.setText(f"{io}_{_type_label(dt)}_")
 
         start = self.startb.value()
         nbytes = self._nbytes()
@@ -1149,7 +1174,7 @@ class PnSignalForm(InspectorForm):
         start = self.startb.value()
         n = self.count.value()
         prefix = self.prefix.text().strip() or \
-            f"{'In' if m['direction'] == 'input' else 'Out'}_{dt}_"
+            f"{'In' if m['direction'] == 'input' else 'Out'}_{_type_label(dt)}_"
         ns, dg = self.nstart.value(), self.digits.value()
         self.cfg["naming"] = {"start": ns, "digits": dg}
         self.cfg["last_type"] = dt
@@ -1173,7 +1198,7 @@ class PnSignalForm(InspectorForm):
                                 byte=start + i * each, bit=0, arr=1))
         else:                                        # one array signal
             arr = n * 8 if self._is_bit() else n
-            name = prefix.rstrip("_") or f"{dt}_array"
+            name = prefix.rstrip("_") or f"{_type_label(dt)}_array"
             new.append(dict(name=name, dtype=dt, byte=start, bit=0, arr=arr))
 
         # assign each new signal its UID here (not at write time) so the window can
@@ -1366,7 +1391,7 @@ class EipAddForm(InspectorForm):
         self.idx.setRange(0, max(0, len(iface.signals) - 1))
         dn = self.dtype.currentText()
         if not self._prefix_touched:        # keep in sync with the type until user-edited
-            self.prefix.setText(f"{iface.direction}_{dn}_")
+            self.prefix.setText(f"{iface.direction}_{_type_label(dn)}_")
         self.count.setMaximum(max(1, self._free_bits() // self._per()))
         self._update_info()
 
