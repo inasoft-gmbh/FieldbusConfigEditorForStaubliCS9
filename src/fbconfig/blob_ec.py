@@ -441,22 +441,31 @@ def set_direction_signals(blob: bytes, direction: str, desired, size_bytes=None)
     template = blocks[0].group(0)
     old = {(re.search(r'systemTag="([^"]*)"', b.group(0)) or [None, ""])[1]: b.group(0)
            for b in blocks}
-    new_blocks, access = [], 0
+    # BIT cursor — replicates Interface.repack_bits exactly: bits pack tight, value
+    # (non-bit) types are byte-aligned. This makes single sub-byte bits (arrayElements=1)
+    # land at their real bit offset (6103) instead of all stacking at byte 0; byte-aligned
+    # signals are unchanged (byte = cur//8, 6103 = cur = byte*8, as before).
+    new_blocks, cur = [], 0
     for tag, name, dtype, ae in desired:
         w = _XML_WIDTH.get(dtype)
-        width = ae // 8 if w is None else w * ae
+        if w is not None and cur % 8:                 # byte-align value types
+            cur += 8 - (cur % 8)
+        width_bits = ae if w is None else w * 8 * ae
+        byte, bit = cur // 8, cur % 8
+        ap = str(byte) if bit == 0 else f"{byte}.{bit}"   # byte, or byte.bit for a sub-byte bit
         blk = old.get(tag, template)
         blk = _set_attr(blk, "systemTag", tag)
         blk = _set_attr(blk, "displayName", name)
         blk = _set_attr(blk, "dataType", dtype)
         blk = _set_attr(blk, "arrayElements", str(ae))
-        blk = _set_attr(blk, "signalAccessPath", str(access))
+        blk = _set_attr(blk, "signalAccessPath", ap)
         if tag not in old:
             blk = _set_prop(blk, "6100", _fresh_6100())
         blk = _set_prop(blk, "6103",
-                        base64.b64encode(_s.pack("<I", access * 8)).decode("ascii"))
+                        base64.b64encode(_s.pack("<I", cur)).decode("ascii"))
         new_blocks.append(blk)
-        access += width
+        cur += width_bits
+    access = (cur + 7) // 8                            # process-image byte span
     new_body = lead + sep.join(new_blocks) + trailer
     cs["ECTDeviceBasic"] = _put_dev_xml(dev, xml[:m.start(2)] + new_body + xml[m.end(2):])
     # PdoEntryList: exactly `access` BYTE entries (reuse existing, clone for the extras)
