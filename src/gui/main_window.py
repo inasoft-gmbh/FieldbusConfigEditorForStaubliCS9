@@ -23,7 +23,7 @@ from gui.inspector import (InspectorPanel, AddForm, ResizeForm, GeneralForm,
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QToolBar, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QProgressBar, QSplitter,
+    QHeaderView, QProgressBar, QSplitter, QMenu,
     QAbstractItemView, QSizePolicy,
 )
 
@@ -93,9 +93,11 @@ class SignalTable(QTableWidget):
         self._hl_row: int | None = None       # current drop-target highlight
         self._anim: QVariantAnimation | None = None
         self._loading = False                  # guard itemChanged during render
+        self._locked = False                   # frozen while an Add/Edit form is open
         self._name_col = len(headers) - 1      # Name is the last column
         self._preview_rows: list[int] = []     # live 'where the new data lands'
         self.itemChanged.connect(self._on_item_changed)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)   # right-click -> Edit/Delete
         self.setHorizontalHeaderLabels(headers)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -110,7 +112,20 @@ class SignalTable(QTableWidget):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(len(headers) - 1, QHeaderView.Stretch)
 
+    def set_locked(self, locked: bool):
+        """Freeze the table while an Add/Edit form is open: no selection change,
+        clicks, drag-drop or context menu — but keep it readable so the live landing
+        preview stays visible. Start byte / length come from the form, not new clicks."""
+        self._locked = locked
+        self.setDragEnabled(not locked)
+        self.setAcceptDrops(not locked)
+        self.setSelectionMode(QAbstractItemView.NoSelection if locked
+                              else QAbstractItemView.ExtendedSelection)
+
     def mousePressEvent(self, e):
+        if self._locked:                       # a form is open -> the table is frozen
+            e.ignore()
+            return
         # Clicking empty space (below the rows) clears the selection, so a following
         # Add reliably means "outside any slot -> new slot" (PROFINET) rather than
         # acting on a stale selection.
@@ -118,6 +133,18 @@ class SignalTable(QTableWidget):
         if not self.indexAt(e.position().toPoint()).isValid():
             self.clearSelection()
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if self._locked:                       # no in-cell rename while a form is open
+            e.ignore()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def keyPressEvent(self, e):
+        if self._locked:                       # no keyboard selection moves either
+            e.ignore()
+            return
+        super().keyPressEvent(e)
 
     def focusInEvent(self, e):
         self.focused.emit()
@@ -221,6 +248,17 @@ class SignalTable(QTableWidget):
                 if isinstance(b, int):
                     return b
         return None
+
+    def selected_byte_count(self) -> int:
+        """How many process-image bytes the selection covers — the LENGTH the Add form
+        takes over when several bytes are selected. Each free byte row = 1 byte (the
+        intended 'select empty space' workflow), so this is the exact byte span there;
+        signal rows count once each."""
+        rows = {ix.row() for ix in self.selectionModel().selectedRows()}
+        return sum(1 for r in rows
+                   if 0 <= r < len(self.rowmeta) and self.rowmeta[r]
+                   and isinstance(self.rowmeta[r][-1], int)
+                   and self.rowmeta[r][0] in ("free", "sig", "pnfree", "pnsig"))
 
     def pn_context(self):
         """PROFINET: the rowmeta tuple of the first selected slot/signal/free row, or
@@ -444,6 +482,8 @@ class IfaceTable(QWidget):
     def _on_cell_clicked(self, row, col):
         """Click the ▾/▸ toggle in column 0 of a slot header -> collapse/expand the slot
         (hide/show its signals) for a cleaner overview."""
+        if self.table._locked:                 # frozen while an Add/Edit form is open
+            return
         meta = self.table.rowmeta[row] if row < len(self.table.rowmeta) else None
         if col == 0 and meta and meta[0] == "pnmod":
             slot = meta[1]
@@ -815,6 +855,9 @@ class MainWindow(QMainWindow):
             lambda i, n: self._commit_name(self.state.model.out, i, n))
         self.in_tbl.table.pnNameEdited.connect(self._pn_rename)
         self.out_tbl.table.pnNameEdited.connect(self._pn_rename)
+        for t in (self.in_tbl, self.out_tbl):      # right-click -> Edit / Delete
+            t.table.customContextMenuRequested.connect(
+                lambda pos, tbl=t.table: self._table_context_menu(tbl, pos))
         self.tbl_split.addWidget(self.in_tbl)
         self.tbl_split.addWidget(self.out_tbl)
         self.tbl_split.setHandleWidth(26)          # clear gap so the In scrollbar
@@ -846,6 +889,10 @@ class MainWindow(QMainWindow):
         self.inspector = InspectorPanel(self)
         self.inspector.applied.connect(self._on_inspector_applied)
         self.inspector.closed.connect(self._clear_previews)
+        # while a form is open the tables freeze (no stray clicks); they unfreeze on
+        # apply / cancel / close.
+        self.inspector.opened.connect(self._lock_tables_for_form)
+        self.inspector.closed.connect(self._unlock_tables)
         outer.addWidget(self.inspector, 0)
 
     def _sync_add_start(self, tbl, direction):
@@ -1226,7 +1273,9 @@ class MainWindow(QMainWindow):
         start = tbl.table.selected_start_byte()
         if start is None:
             start = iface.used_bytes                  # default: the first free byte
-        form = ec_signal_form(m, self.cfg, direction, start_byte=start)
+        span = tbl.table.selected_byte_count()        # several bytes selected -> length
+        form = ec_signal_form(m, self.cfg, direction, start_byte=start,
+                              span_bytes=span if span > 1 else 0)
         form.preview.connect(self._preview_add)
         self.inspector.open(form, "Add signal", "Add")
 
@@ -1288,6 +1337,32 @@ class MainWindow(QMainWindow):
         self.in_tbl.table.clear_preview()
         self.out_tbl.table.clear_preview()
 
+    def _lock_tables_for_form(self):
+        for t in (self.in_tbl, self.out_tbl):
+            t.table.set_locked(True)
+
+    def _unlock_tables(self):
+        for t in (self.in_tbl, self.out_tbl):
+            t.table.set_locked(False)
+
+    def _table_context_menu(self, table, pos):
+        """Right-click a signal table -> Edit / Delete on the current selection. The
+        right-clicked row joins the selection if it wasn't part of it (standard behaviour).
+        Suppressed while an Add/Edit form is open (the tables are frozen then)."""
+        if not self.state.loaded or table._locked:
+            return
+        idx = table.indexAt(pos)
+        if idx.isValid():
+            selected = {ix.row() for ix in table.selectionModel().selectedRows()}
+            if idx.row() not in selected:
+                table.selectRow(idx.row())
+        table.setFocus()
+        self._update_action_states()
+        menu = QMenu(self)
+        menu.addAction(self.act_rename)            # "Edit"
+        menu.addAction(self.act_delete)
+        menu.exec(table.viewport().mapToGlobal(pos))
+
     def _on_add_eip(self):
         m = self.state.model
         # Offer the FULL data-type catalog (not just types already present): every
@@ -1339,6 +1414,16 @@ class MainWindow(QMainWindow):
             return self._on_edit_profinet()
         iface, tbl, idxs = self._active_selection()
         if idxs and len(idxs) > 1:
+            # several signals: a homogeneous (same type) + contiguous run opens the FULL
+            # edit page pre-filled from the selection (start byte / type / count / name
+            # scheme), UIDs kept in order; a mixed selection falls back to batch rename.
+            structural = bool(raw.get("structural", not raw.get("modular")))
+            if structural and self._homogeneous_contiguous(iface, idxs):
+                sigs = [iface.signals[i] for i in idxs]
+                form = ec_signal_form(self.state.model, self.cfg, iface.direction,
+                                      edit_sigs=sigs)
+                form.preview.connect(self._preview_add)
+                return self.inspector.open(form, f"Edit {len(sigs)} signals", "Apply")
             return self._rename_batch(iface, idxs)
         if idxs:
             # Structural-capable flat protocols (EtherCAT / POWERLINK) use the SAME full edit
@@ -1499,8 +1584,15 @@ class MainWindow(QMainWindow):
         m = self.state.model
         sig_metas = [mm for mm in self.in_tbl.table.pn_selected_metas()
                      if mm[0] == "pnsig"]
-        if len(sig_metas) > 1:                        # several signals -> batch rename
-            return self._pn_batch_rename(sig_metas)
+        if len(sig_metas) > 1:                        # several signals
+            sel = self._pn_multi_edit_set(sig_metas)
+            if sel is not None:                       # homogeneous + one slot -> full edit
+                module, direction, sset = sel
+                form = PnSignalForm(m, self.cfg, module, direction, edit_set=sset)
+                form.preview.connect(self._preview_add)
+                return self.inspector.open(
+                    form, f"Edit {len(sset)} signals · Slot {module['slot']}", "Apply")
+            return self._pn_batch_rename(sig_metas)   # mixed -> batch rename
         direction, module, ctx = self._pn_resolve()
         if ctx is None:                               # empty area -> new slot (pick In/Out)
             self.inspector.open(ModuleForm(m), "Add slot", "Add")
@@ -1728,6 +1820,33 @@ class MainWindow(QMainWindow):
         self._pn_select_uids([uid])
         self._status(f"Renamed to '{new}'.", "success")
 
+    def _pn_multi_edit_set(self, sig_metas):
+        """(module, direction, [sig dicts]) if the selected PROFINET signals are a
+        homogeneous (same type), single-slot, contiguous run — the precondition for the
+        full multi-edit page; else None (caller falls back to batch rename). PROFINET
+        signals belong to a slot, so the whole set must live in ONE slot."""
+        bym = {x["slot"]: x for x in (self.state.model.raw.get("pn_module_list") or [])}
+        slots = {mm[1] for mm in sig_metas}
+        if len(slots) != 1:
+            return None
+        module = bym.get(next(iter(slots)))
+        if module is None:
+            return None
+        sigs = [self._pn_find_signal(module, mm) for mm in sig_metas]
+        if any(s is None for s in sigs):
+            return None
+        if len({s["dtype"] for s in sigs}) != 1:
+            return None
+        if any(s.get("arr", 1) != 1 for s in sigs):
+            return None
+        # contiguous within the slot: consecutive positions in the slot's byte-sorted list
+        occ = sorted(module["signals"], key=lambda s: (s["byte"], s.get("bit", 0)))
+        pos = sorted(occ.index(s) for s in sigs)
+        if pos != list(range(pos[0], pos[0] + len(pos))):
+            return None
+        direction = "In" if module["direction"] == "input" else "Out"
+        return module, direction, sigs
+
     def _pn_batch_rename(self, sig_metas):
         """Rename several selected PROFINET signals at once: a base name + numbering
         (BatchRenameDialog). Only the name changes — UID/type/address are kept."""
@@ -1796,6 +1915,18 @@ class MainWindow(QMainWindow):
         iface.signals[idx].name = new
         self._refresh()
         self._status(f"Renamed to '{new}'.", "success")
+
+    def _homogeneous_contiguous(self, iface, idxs):
+        """True if the selected signals are all the SAME data type, all plain values
+        (arrayElements==1) and a CONTIGUOUS run (no other signal between them) — the
+        precondition for the full multi-edit page. Signals are stored byte-sorted, so a
+        contiguous run is a block of consecutive model indices."""
+        sigs = [iface.signals[i] for i in idxs]
+        if len({s.sycon_dtype for s in sigs}) != 1:
+            return False
+        if any((s.array_elements or 1) != 1 for s in sigs):
+            return False
+        return sorted(idxs) == list(range(min(idxs), min(idxs) + len(idxs)))
 
     def _rename_batch(self, iface, idxs):
         dlg = BatchRenameDialog(len(idxs), self.cfg, iface.direction, self)

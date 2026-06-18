@@ -768,6 +768,21 @@ _SIG_BITS = {"bit": 1, "byte": 8, "signed8": 8, "unsigned8": 8,
 _SIG_DTYPES = list(_SIG_BITS.items())
 
 
+def _derive_naming(names):
+    """(prefix, numbering-start, digits) inferred from existing signal names so a
+    multi-row Edit pre-fills exactly the selection's scheme. Uses the FIRST name's
+    trailing digit run (e.g. 'In_byte_03' -> 'In_byte_', start 3, digits 2); without a
+    trailing number, falls back to the common prefix + start 0."""
+    import re
+    import os
+    if not names:
+        return "", 0, 1
+    m = re.search(r"(\d+)$", names[0])
+    if m:
+        return names[0][:m.start()], int(m.group(1)), len(m.group(1))
+    return os.path.commonprefix(names), 0, 1
+
+
 class ModuleEditForm(InspectorForm):
     """Edit a PROFINET module: change its SIZE (swap catalog module) and/or SLOT number.
     Rebuilds the whole module set (delete-all + re-add, byte-exact) keeping the order and
@@ -899,14 +914,18 @@ class PnSignalForm(InspectorForm):
     # (direction, global_start_byte, n_bytes, fits) — live landing preview
     preview = Signal(str, int, int, bool)
 
-    def __init__(self, model, cfg, module, direction, start_byte=0, edit=None):
+    def __init__(self, model, cfg, module, direction, start_byte=0, edit=None,
+                 span_bytes=0, edit_set=None):
         super().__init__()
         self.model = model
         self.cfg = cfg
         self.paths = model.raw["paths"]
         self.module = module                       # parse_modules dict for this slot
         self.dirn = direction                      # "In" / "Out"
-        self.edit = edit                           # signal dict being edited, or None
+        self.edit = edit                           # single signal dict being edited
+        self.edit_set = list(edit_set) if edit_set else None  # several signals -> rebuild
+        self._span_bytes = span_bytes              # selected byte span -> default count
+        self._edit_uids = []                       # UIDs to keep, in order (multi-edit)
         # The flat protocols (EtherCAT / EtherNet/IP / POWERLINK) reuse this EXACT page —
         # the whole direction is one synthetic slot; only the header text + apply() target
         # differ (model rebuild vs the PROFINET blob writer). PROFINET keeps the slot model.
@@ -923,6 +942,9 @@ class PnSignalForm(InspectorForm):
             self._cur = [s for s in self._cur if s is not edit and not (
                 s["byte"] == edit["byte"] and s.get("bit", 0) == edit.get("bit", 0)
                 and s["dtype"] == edit["dtype"] and s["name"] == edit["name"])]
+        elif self.edit_set:                        # multi-edit: drop the whole set by UID
+            _drop = {s.get("uid") for s in self.edit_set}
+            self._cur = [s for s in self._cur if s.get("uid") not in _drop]
         self._ok = False
         self._build()
         self.startb.setMaximum(max(0, module["size"] - 1))
@@ -935,9 +957,35 @@ class PnSignalForm(InspectorForm):
             self.startb.setValue(min(edit["byte"], module["size"] - 1))
             self.prefix.setText(edit["name"])
             self._prefix_touched = True            # keep the edited signal's name as-is
+        elif self.edit_set:
+            # several homogeneous, contiguous signals -> pre-fill the full page from the
+            # selection (type / count / start / name scheme), all editable; UIDs travel.
+            sset = sorted(self.edit_set, key=lambda s: (s["byte"], s.get("bit", 0)))
+            self._edit_uids = [s.get("uid") for s in sset]
+            self.dtype.setCurrentText(sset[0]["dtype"])
+            self.arr_cb.setChecked(False)          # separate values
+            self.count.setValue(len(sset))
+            self.startb.setValue(min(sset[0]["byte"], module["size"] - 1))
+            pfx, ns, dg = _derive_naming([s["name"] for s in sset])
+            self.prefix.setText(pfx)
+            self._prefix_touched = True            # keep the selection's prefix
+            self.nstart.setValue(ns)
+            self.digits.setValue(dg)
         else:
             self.startb.setValue(min(start_byte, module["size"] - 1))
+            if self._span_bytes > 1:               # multi-byte selection -> default count
+                self._apply_span()
         self._recompute()
+
+    def _apply_span(self):
+        """Take the selected byte span as the default LENGTH: count = span ÷ type width
+        (floor; the leftover is flagged in _recompute). Bits fill the span (×8)."""
+        dt = self._dt()
+        if dt == "bit":
+            self.count.setValue(max(1, self._span_bytes * 8))
+            return
+        each = _SIG_BITS[dt] // 8
+        self.count.setValue(max(1, self._span_bytes // each))
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -1068,6 +1116,13 @@ class PnSignalForm(InspectorForm):
                 f"({nbytes} B) → global {m['global_start'] + start}–"
                 f"{m['global_start'] + start + nbytes - 1}.")
 
+        if self._span_bytes > 1 and not self._is_bit():
+            each = _SIG_BITS[dt] // 8
+            if self._span_bytes % each:            # selection didn't divide evenly
+                self.info.setText(self.info.text() +
+                                  f"  ⚠ {self._span_bytes} B selection is not a "
+                                  f"multiple of {each} B — count was rounded down.")
+
         msg = ""
         if not bit_ok:
             msg = "✕ Separate bits must come in whole bytes — use a count of 8, 16, …"
@@ -1128,7 +1183,14 @@ class PnSignalForm(InspectorForm):
         import uuid
         for s in new:
             s["uid"] = str(uuid.uuid4())
-        if self.edit is not None and new and self.edit.get("uid"):
+        if self.edit_set:
+            # keep the selection's systemTags in order: same count -> all preserved,
+            # more -> extras get fresh UIDs, fewer -> surplus UIDs drop. PLC links survive
+            # ([[systemtag-must-travel]]).
+            for i, s in enumerate(new):
+                if i < len(self._edit_uids) and self._edit_uids[i]:
+                    s["uid"] = self._edit_uids[i]
+        elif self.edit is not None and new and self.edit.get("uid"):
             new[0]["uid"] = self.edit["uid"]
         self._cur.extend(new)
         if self.is_flat:
@@ -1158,7 +1220,8 @@ class PnSignalForm(InspectorForm):
             uids = {s["uid"] for s in new}
             self.added = [s for s in self.iface.signals if s.systemtag in uids]
             self.direction = self.iface.direction
-            verb = "Edited" if self.edit is not None else f"Added {len(new)}"
+            verb = ("Edited" if (self.edit is not None or self.edit_set)
+                    else f"Added {len(new)}")
             return f"{verb} signal(s) in {self.iface.direction}. Re-validate in SyCon.net."
         self.pn_added_uids = [s["uid"] for s in new]
         self.pn_direction = self.dirn
@@ -1168,12 +1231,14 @@ class PnSignalForm(InspectorForm):
         backup.make_backup(self.paths, datetime.now())
         self.paths.sycon_xml.write_text(new_xml, encoding="utf-8")
         self.reload_after = True
-        verb = "Updated" if self.edit is not None else f"Added {len(new)}"
+        verb = ("Updated" if (self.edit is not None or self.edit_set)
+                else f"Added {len(new)}")
         return (f"{verb} signal(s) in Slot {m['slot']}. "
                 f"{len(self._cur)} signals in the slot now.")
 
 
-def ec_signal_form(model, cfg, direction, start_byte=0, edit_sig=None):
+def ec_signal_form(model, cfg, direction, start_byte=0, edit_sig=None,
+                   span_bytes=0, edit_sigs=None):
     """Open the PROFINET signal page (the SAME PnSignalForm) for a FLAT protocol — EtherCAT /
     EtherNet/IP / POWERLINK — so the GUI + data-type selection are identical everywhere. The
     whole direction is one synthetic slot (size = interface budget); PnSignalForm rebuilds the
@@ -1197,7 +1262,12 @@ def ec_signal_form(model, cfg, direction, start_byte=0, edit_sig=None):
     edit = None
     if edit_sig is not None:
         edit = next((d for d in sigs if d["uid"] == edit_sig.systemtag), None)
-    return PnSignalForm(model, cfg, module, direction, start_byte=start_byte, edit=edit)
+    edit_set = None
+    if edit_sigs:
+        want = {s.systemtag for s in edit_sigs}
+        edit_set = [d for d in sigs if d["uid"] in want]
+    return PnSignalForm(model, cfg, module, direction, start_byte=start_byte,
+                        edit=edit, span_bytes=span_bytes, edit_set=edit_set)
 
 
 # ------------------------------------------------------- Add (EtherNet/IP bits)
@@ -1357,6 +1427,7 @@ class InspectorPanel(QFrame):
 
     applied = Signal(str)        # emitted with the summary after a successful apply
     closed = Signal()            # emitted when the panel hides (apply or cancel)
+    opened = Signal()            # emitted when a form is shown (freeze the tables)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1424,6 +1495,7 @@ class InspectorPanel(QFrame):
         self._refresh_validity()
         self.setVisible(True)
         self.apply_btn.setFocus()
+        self.opened.emit()
 
     def _refresh_validity(self):
         if self.current_form is not None:
