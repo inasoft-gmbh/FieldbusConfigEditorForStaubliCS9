@@ -1246,7 +1246,12 @@ class PnSignalForm(InspectorForm):
             # allowed). UID travels. Bit-addressed protocols repack to bit offsets; POWERLINK
             # is byte-addressed (offsets derive from order, bit_offset stays None).
             from fbconfig.model import Signal as Sig
-            st = "input" if self.dirn == "In" else "output"
+            # signal_type is the per-signal direction the bit-addressed protocols
+            # (EtherNet/IP, EtherCAT) carry in the file. POWERLINK has NO such field
+            # (direction is the Interface), so it must stay "" — otherwise the saved
+            # file reads back signal_type="" and every signal trips the round-trip
+            # self-check (false UNVERIFIED), even though the write is correct.
+            st = "" if self.is_pl else ("input" if self.dirn == "In" else "output")
             ordered = sorted(self._cur, key=lambda s: (s["byte"], s.get("bit", 0)))
             snap = list(self.iface.signals)
             self.iface.signals[:] = [
