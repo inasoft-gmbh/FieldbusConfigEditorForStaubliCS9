@@ -125,6 +125,14 @@ def _patch_record_string(s: str, model) -> str:
         if model.device.node_id is not None:
             s = re.sub(r'(id="NODE_ID"[^>]*default=")\d+(")',
                        lambda m: m.group(1) + str(model.device.node_id) + m.group(2), s)
+    # The network (DNS) node name is a blob parameter (datatype string) — the BLOB
+    # is the master, so a name change must be written here, not only into the .nxd.
+    # _rewrite_records re-emits the record with a corrected length prefix, so a name
+    # of any length is safe. (Lives in the same param record as INPUT_LENGTH, but we
+    # match independently in case a variant splits them.)
+    if 'id="DNS_NODE_NAME"' in s and model.device.node_name is not None:
+        s = re.sub(r'(id="DNS_NODE_NAME"[^>]*default=")[^"]*(")',
+                   lambda m: m.group(1) + model.device.node_name + m.group(2), s)
     if "Bytes In'" in s or "InBytes'" in s:
         s = re.sub(r"\d+( Bytes In')", lambda m: f"{model.inp.max_bytes}{m.group(1)}", s)
         s = re.sub(r"\d+( InBytes')", lambda m: f"{model.inp.max_bytes}{m.group(1)}", s)

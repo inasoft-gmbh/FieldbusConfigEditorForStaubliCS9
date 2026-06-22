@@ -19,7 +19,10 @@ def load(paths):
     if paths.nxd:
         info = nxd.read(paths.nxd)
         model.device.node_id = info["node_id"]
-        model.device.node_name = info["name"]
+        # Blob is master for the network name (param DNS_NODE_NAME, set by sycon.load).
+        # Only fall back to the .nxd copy for legacy files whose blob name is empty.
+        if not model.device.node_name:
+            model.device.node_name = info["name"]
         model.device.ip = info["ip"]
         model.raw["nxd"] = info
     return model
